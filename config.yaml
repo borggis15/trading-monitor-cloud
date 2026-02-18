@@ -1,0 +1,48 @@
+timezone: Europe/Madrid
+
+data:
+  provider: twelvedata
+  interval: 15min
+  exchange: XETR
+
+universe:
+  - name: Eli Lilly
+    isin: US5324571083
+    xetra_symbol: LLY
+  - name: Sibanye Stillwater
+    isin: ZAE000259701
+    xetra_symbol: 47V
+  - name: Lundin Mining
+    isin: CA5503721063
+    xetra_symbol: GXD
+  - name: GE Vernova
+    isin: US36828A1016
+    xetra_symbol: Y5C
+  - name: Procter & Gamble
+    isin: US7427181091
+    xetra_symbol: PRG
+  - name: SQM ADR
+    isin: US8336351056
+    xetra_symbol: QYM
+
+signals:
+  capital_eur: 10000
+  risk_per_trade_pct: 0.5
+  max_position_pct: 20
+  sl_atr_mult: 2.5
+  tp_atr_mult: 4.0
+  max_open_positions: 3
+
+ml:
+  enabled: true
+  horizon_bars: 4
+  retrain_every_days: 7
+  model_type: hgb
+  min_train_rows: 800
+
+backtest:
+  fee_bps: 1.0
+  slippage_bps: 2.0
+  walk_forward:
+    train_days: 120
+    test_days: 30
