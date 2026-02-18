@@ -1,0 +1,21 @@
+name: ingest_score_15m
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Run ingest+score
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python -m jobs.ingest_score_15m
