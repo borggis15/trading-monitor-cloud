@@ -139,47 +139,60 @@ def upsert_backtest(engine, exchange: str, symbol: str, m: dict):
         )
 
 
+def fetch_with_fallback(provider: TwelveDataProvider, cfg: dict, inst: dict):
+    """
+    1) Intenta XETR:símbolo (TR-like)
+    2) Si no hay datos, intenta primary_symbol sin exchange (más fiable)
+    Devuelve: (exchange_label, symbol_used, df)
+    """
+    xetr = cfg["data"]["exchange_primary_try"]
+    interval = cfg["data"]["interval"]
+
+    # intento 1: Alemania
+    df = provider.fetch_15m(symbol=inst["xetra_symbol"], exchange=xetr, interval=interval, outputsize=5000)
+    if df is not None and not df.empty:
+        return xetr, inst["xetra_symbol"], df
+
+    print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando fallback primary...")
+
+    # intento 2: primary (sin exchange)
+    # Twelve Data normalmente acepta símbolos como "LLY", "PG", "GEV", "SBSW", "SQM", "LUN.TO"
+    df2 = provider.fetch_15m(symbol=inst["primary_symbol"], exchange="", interval=interval, outputsize=5000)
+    if df2 is not None and not df2.empty:
+        return "PRIMARY", inst["primary_symbol"], df2
+
+    return None, None, pd.DataFrame()
+
+
 def main():
     cfg = load_config()
-    exchange = cfg["data"]["exchange"]
     provider = TwelveDataProvider()
     engine = get_engine()
 
     scored = []
 
     for inst in cfg["universe"]:
-        symbol = inst["xetra_symbol"]
+        ex, sym, df = fetch_with_fallback(provider, cfg, inst)
 
-        # 1) Descargar velas
-        df = provider.fetch_15m(
-            symbol=symbol,
-            exchange=exchange,
-            interval=cfg["data"]["interval"],
-            outputsize=5000,
-        )
-
-        # ✅ Si no hay datos, NO rompemos el workflow: omitimos ese símbolo
-        if df is None or df.empty:
-            print(f"[WARN] Sin datos para {exchange}:{symbol}. Se omite.")
+        if df is None or df.empty or ex is None or sym is None:
+            print(f"[WARN] Sin datos también en fallback para {inst['name']} ({inst['primary_symbol']}). Se omite.")
             continue
 
-        # 2) Guardar barras
-        upsert_bars(engine, exchange, symbol, df, source="twelvedata")
+        # Guardar barras
+        upsert_bars(engine, ex, sym, df, source="twelvedata")
 
-        # 3) Leer barras y calcular features
-        bars = read_bars(engine, exchange, symbol)
+        bars = read_bars(engine, ex, sym)
         if bars is None or bars.empty:
-            print(f"[WARN] bars vacío tras upsert para {exchange}:{symbol}. Se omite.")
+            print(f"[WARN] bars vacío tras upsert para {ex}:{sym}. Se omite.")
             continue
 
         feat = compute_features(bars, horizon_bars=int(cfg["ml"]["horizon_bars"]))
         if feat is None or feat.empty:
-            print(f"[WARN] features vacío para {exchange}:{symbol}. Se omite.")
+            print(f"[WARN] features vacío para {ex}:{sym}. Se omite.")
             continue
 
-        upsert_features(engine, exchange, symbol, feat)
+        upsert_features(engine, ex, sym, feat)
 
-        # 4) Entrenar/predicción (robusto: puede devolver None si no hay suficiente histórico)
         clf, reg, train_rows = train_models(
             feat,
             model_type=cfg["ml"]["model_type"],
@@ -187,25 +200,18 @@ def main():
         )
         proba, ret_exp = predict(clf, reg, feat)
 
-        # 5) Riesgo estimado y EV
         risk_est = None
         last = feat.dropna().tail(1)
-        if not last.empty:
-            atr = float(last["atr"].iloc[0]) if "atr" in last.columns else None
+        if not last.empty and "atr" in last.columns:
+            atr = float(last["atr"].iloc[0])
             price = float(bars["close"].iloc[-1])
-            if atr is not None and price > 0:
+            if price > 0:
                 risk_est = atr / price
 
-        ev = ev_bps(
-            ret_exp,
-            risk_est,
-            float(cfg["backtest"]["fee_bps"]),
-            float(cfg["backtest"]["slippage_bps"]),
-        )
+        ev = ev_bps(ret_exp, risk_est, float(cfg["backtest"]["fee_bps"]), float(cfg["backtest"]["slippage_bps"]))
 
-        # 6) Acción (conservadora)
         action = "HOLD"
-        expl = []
+        expl = [inst["name"], f"Fuente={ex}:{sym}"]
         if proba is not None:
             expl.append(f"Prob(subida)= {proba:.2f}")
         if ret_exp is not None:
@@ -219,7 +225,6 @@ def main():
             elif proba < 0.45 and ev < -2.0:
                 action = "SELL"
 
-        # 7) Sizing + SL/TP si BUY
         size_eur = sl = tp = None
         if action == "BUY" and not last.empty and "atr" in last.columns:
             atr = float(last["atr"].iloc[0])
@@ -237,8 +242,8 @@ def main():
         ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
         scored.append(
             {
-                "exchange": exchange,
-                "symbol": symbol,
+                "exchange": ex,
+                "symbol": sym,
                 "ts": ts,
                 "action": action,
                 "proba_up": proba,
@@ -254,11 +259,10 @@ def main():
             }
         )
 
-        # 8) Backtest walk-forward (puede tardar; si lo quieres más ligero lo movemos a semanal)
         bt = walk_forward_metrics(bars, cfg)
-        upsert_backtest(engine, exchange, symbol, bt)
+        upsert_backtest(engine, ex, sym, bt)
 
-    # 9) Asignación de capital: solo top EV BUY hasta max_open_positions
+    # asignación: top EV BUY
     maxpos = int(cfg["signals"]["max_open_positions"])
     buys = [r for r in scored if r["action"] == "BUY" and r["ev_bps"] is not None]
     buys_sorted = sorted(buys, key=lambda r: r["ev_bps"], reverse=True)
@@ -275,7 +279,7 @@ def main():
 
     print("OK:", len(scored), "symbols processed")
     if len(scored) == 0:
-        print("[WARN] No se procesó ningún símbolo. Revisa que Twelve Data devuelva datos para XETR + tus tickers.")
+        print("[WARN] No se procesó ningún símbolo. Twelve Data no devuelve datos ni en XETR ni en fallback primary.")
 
 
 if __name__ == "__main__":
