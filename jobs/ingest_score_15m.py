@@ -12,6 +12,9 @@ from core.ml import train_models, predict
 from core.risk import size_from_atr, ev_bps
 
 
+OUTPUTSIZE_DAILY = 400  # ✅ mucho más rápido que 1200
+
+
 def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str):
     if df is None or df.empty:
         return 0
@@ -121,15 +124,18 @@ def fetch_with_fallback(provider: TwelveDataProvider, cfg: dict, inst: dict):
     xetr = cfg["data"]["exchange_primary_try"]
     interval = cfg["data"]["interval"]
 
-    df = provider.fetch_15m(symbol=inst["xetra_symbol"], exchange=xetr, interval=interval, outputsize=1200)
+    # intento 1: XETR
+    df = provider.fetch_15m(symbol=inst["xetra_symbol"], exchange=xetr, interval=interval, outputsize=OUTPUTSIZE_DAILY)
     if df is not None and not df.empty:
         return xetr, inst["xetra_symbol"], df
 
     print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando fallback primary...")
 
-    df2 = provider.fetch_15m(symbol=inst["primary_symbol"], exchange="", interval=interval, outputsize=1200)
+    # intento 2: primary con exchange opcional
+    pex = inst.get("primary_exchange", "") or ""
+    df2 = provider.fetch_15m(symbol=inst["primary_symbol"], exchange=pex, interval=interval, outputsize=OUTPUTSIZE_DAILY)
     if df2 is not None and not df2.empty:
-        return "PRIMARY", inst["primary_symbol"], df2
+        return (pex if pex else "PRIMARY"), inst["primary_symbol"], df2
 
     return None, None, pd.DataFrame()
 
@@ -172,7 +178,6 @@ def main():
         )
         proba, ret_exp = predict(clf, reg, feat)
 
-        # riesgo aproximado
         risk_est = None
         last = feat.dropna().tail(1)
         if not last.empty and "atr" in last.columns:
@@ -188,7 +193,6 @@ def main():
             float(cfg["backtest"]["slippage_bps"]),
         )
 
-        # señal (aunque no haya modelo, insertamos HOLD)
         action = "HOLD"
         expl = [name, f"Fuente={ex}:{sym}", f"interval={cfg['data']['interval']}"]
         if proba is not None:
