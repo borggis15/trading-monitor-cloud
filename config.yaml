@@ -2,14 +2,10 @@ timezone: Europe/Madrid
 
 data:
   provider: twelvedata
-  interval: 15min
+  # ✅ Free-friendly:
+  interval: 1day
 
-  # Intento 1 (TR-like): Alemania
   exchange_primary_try: XETR
-
-  # Intento 2 (fallback): mercado principal (más fiable para intradía gratis)
-  # OJO: Twelve Data usa distintos códigos de exchange según el mercado.
-  # Para USA suele funcionar sin exchange o con "NYSE"/"NASDAQ". Aquí lo haremos sin exchange.
   fallback_mode: primary
 
 universe:
@@ -53,14 +49,14 @@ signals:
 
 ml:
   enabled: true
-  horizon_bars: 4
+  horizon_bars: 5         # ✅ 5 días adelante (en vez de 4 barras de 15m)
   retrain_every_days: 7
   model_type: hgb
-  min_train_rows: 800
+  min_train_rows: 200     # ✅ para empezar antes
 
 backtest:
   fee_bps: 1.0
   slippage_bps: 2.0
   walk_forward:
-    train_days: 120
-    test_days: 30
+    train_days: 365
+    test_days: 90
