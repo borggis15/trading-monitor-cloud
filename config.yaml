@@ -3,27 +3,45 @@ timezone: Europe/Madrid
 data:
   provider: twelvedata
   interval: 15min
-  exchange: XETR
+
+  # Intento 1 (TR-like): Alemania
+  exchange_primary_try: XETR
+
+  # Intento 2 (fallback): mercado principal (más fiable para intradía gratis)
+  # OJO: Twelve Data usa distintos códigos de exchange según el mercado.
+  # Para USA suele funcionar sin exchange o con "NYSE"/"NASDAQ". Aquí lo haremos sin exchange.
+  fallback_mode: primary
 
 universe:
   - name: Eli Lilly
     isin: US5324571083
     xetra_symbol: LLY
+    primary_symbol: LLY
+
   - name: Sibanye Stillwater
     isin: ZAE000259701
     xetra_symbol: 47V
+    primary_symbol: SBSW
+
   - name: Lundin Mining
     isin: CA5503721063
     xetra_symbol: GXD
+    primary_symbol: LUN.TO
+
   - name: GE Vernova
     isin: US36828A1016
     xetra_symbol: Y5C
+    primary_symbol: GEV
+
   - name: Procter & Gamble
     isin: US7427181091
     xetra_symbol: PRG
+    primary_symbol: PG
+
   - name: SQM ADR
     isin: US8336351056
     xetra_symbol: QYM
+    primary_symbol: SQM
 
 signals:
   capital_eur: 10000
