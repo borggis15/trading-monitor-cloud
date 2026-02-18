@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import pandas as pd
 from sqlalchemy import text
 from datetime import datetime, timezone
@@ -10,6 +11,24 @@ from core.providers import TwelveDataProvider
 from core.features import compute_features
 from core.ml import train_models, predict
 from core.risk import size_from_atr, ev_bps
+
+
+# --- Timeout duro por símbolo (Linux/GitHub runner) ---
+import signal
+
+class TimeoutError(Exception):
+    pass
+
+def _alarm_handler(signum, frame):
+    raise TimeoutError("Timeout por símbolo")
+
+def run_with_timeout(seconds: int, fn, *args, **kwargs):
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(int(seconds))
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.alarm(0)
 
 
 def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str):
@@ -121,14 +140,12 @@ def fetch_with_fallback(provider: TwelveDataProvider, cfg: dict, inst: dict):
     xetr = cfg["data"]["exchange_primary_try"]
     interval = cfg["data"]["interval"]
 
-    # 1) XETR
     df = provider.fetch_15m(symbol=inst["xetra_symbol"], exchange=xetr, interval=interval, outputsize=800)
     if df is not None and not df.empty:
         return xetr, inst["xetra_symbol"], df
 
     print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando fallback primary...")
 
-    # 2) Primary (sin exchange)
     df2 = provider.fetch_15m(symbol=inst["primary_symbol"], exchange="", interval=interval, outputsize=800)
     if df2 is not None and not df2.empty:
         return "PRIMARY", inst["primary_symbol"], df2
@@ -136,121 +153,123 @@ def fetch_with_fallback(provider: TwelveDataProvider, cfg: dict, inst: dict):
     return None, None, pd.DataFrame()
 
 
+def process_one(engine, provider, cfg, inst):
+    name = inst["name"]
+    t0 = time.time()
+    print(f"[START] {name}")
+
+    ex, sym, df = fetch_with_fallback(provider, cfg, inst)
+    if df is None or df.empty or ex is None or sym is None:
+        print(f"[SKIP] {name}: sin datos")
+        return False
+
+    n = upsert_bars(engine, ex, sym, df, source="twelvedata")
+    print(f"[INFO] {name}: upsert bars {ex}:{sym} -> {n} filas")
+
+    bars = read_bars(engine, ex, sym)
+    if bars is None or bars.empty:
+        print(f"[SKIP] {name}: bars vacío tras upsert")
+        return False
+
+    feat = compute_features(bars, horizon_bars=int(cfg["ml"]["horizon_bars"]))
+    if feat is None or feat.empty:
+        print(f"[SKIP] {name}: features vacío")
+        return False
+
+    upsert_features(engine, ex, sym, feat)
+
+    clf, reg, train_rows = train_models(
+        feat,
+        model_type=cfg["ml"]["model_type"],
+        min_rows=int(cfg["ml"]["min_train_rows"]),
+    )
+    proba, ret_exp = predict(clf, reg, feat)
+
+    risk_est = None
+    last = feat.dropna().tail(1)
+    if not last.empty and "atr" in last.columns:
+        atr = float(last["atr"].iloc[0])
+        price = float(bars["close"].iloc[-1])
+        if price > 0:
+            risk_est = atr / price
+
+    ev = ev_bps(
+        ret_exp,
+        risk_est,
+        float(cfg["backtest"]["fee_bps"]),
+        float(cfg["backtest"]["slippage_bps"]),
+    )
+
+    action = "HOLD"
+    expl = [name, f"Fuente={ex}:{sym}"]
+    if proba is not None:
+        expl.append(f"Prob(subida)= {proba:.2f}")
+    if ret_exp is not None:
+        expl.append(f"Ret exp ≈ {ret_exp*100:.2f}%")
+    if ev is not None:
+        expl.append(f"EV ≈ {ev:.1f} bps")
+
+    if proba is not None and ret_exp is not None and ev is not None:
+        if proba > 0.60 and ev > 2.0:
+            action = "BUY"
+        elif proba < 0.45 and ev < -2.0:
+            action = "SELL"
+
+    size_eur = sl = tp = None
+    if action == "BUY" and not last.empty and "atr" in last.columns:
+        atr = float(last["atr"].iloc[0])
+        price = float(bars["close"].iloc[-1])
+        size_eur, sl = size_from_atr(
+            capital_eur=float(cfg["signals"]["capital_eur"]),
+            risk_pct=float(cfg["signals"]["risk_per_trade_pct"]),
+            max_pos_pct=float(cfg["signals"]["max_position_pct"]),
+            price=price,
+            atr=atr,
+            sl_atr_mult=float(cfg["signals"]["sl_atr_mult"]),
+        )
+        tp = float(price + float(cfg["signals"]["tp_atr_mult"]) * atr)
+
+    ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
+
+    upsert_signal(engine, {
+        "exchange": ex,
+        "symbol": sym,
+        "ts": ts,
+        "action": action,
+        "proba_up": proba,
+        "ret_exp": ret_exp,
+        "risk_est": risk_est,
+        "ev_bps": ev,
+        "size_eur": size_eur,
+        "sl_price": sl,
+        "tp_price": tp,
+        "horizon": f"{int(cfg['ml']['horizon_bars']) * 15}min",
+        "explanation": " | ".join(expl),
+        "model_id": f"{cfg['ml']['model_type']}_{cfg['ml']['horizon_bars']}",
+    })
+
+    dt = time.time() - t0
+    print(f"[END] {name} en {dt:.1f}s (train_rows={train_rows})")
+    return True
+
+
 def main():
     cfg = load_config()
     provider = TwelveDataProvider()
     engine = get_engine()
 
-    scored = []
-
+    ok = 0
     for inst in cfg["universe"]:
-        ex, sym, df = fetch_with_fallback(provider, cfg, inst)
+        try:
+            # ✅ 60s máx por símbolo: si se cuelga, lo saltamos
+            if run_with_timeout(60, process_one, engine, provider, cfg, inst):
+                ok += 1
+        except TimeoutError:
+            print(f"[TIMEOUT] {inst['name']} >60s, se omite.")
+        except Exception as e:
+            print(f"[ERROR] {inst['name']}: {e}")
 
-        if df is None or df.empty or ex is None or sym is None:
-            print(f"[WARN] Sin datos también en fallback para {inst['name']} ({inst['primary_symbol']}). Se omite.")
-            continue
-
-        upsert_bars(engine, ex, sym, df, source="twelvedata")
-
-        bars = read_bars(engine, ex, sym)
-        if bars is None or bars.empty:
-            print(f"[WARN] bars vacío tras upsert para {ex}:{sym}. Se omite.")
-            continue
-
-        feat = compute_features(bars, horizon_bars=int(cfg["ml"]["horizon_bars"]))
-        if feat is None or feat.empty:
-            print(f"[WARN] features vacío para {ex}:{sym}. Se omite.")
-            continue
-
-        upsert_features(engine, ex, sym, feat)
-
-        clf, reg, train_rows = train_models(
-            feat,
-            model_type=cfg["ml"]["model_type"],
-            min_rows=int(cfg["ml"]["min_train_rows"]),
-        )
-        proba, ret_exp = predict(clf, reg, feat)
-
-        risk_est = None
-        last = feat.dropna().tail(1)
-        if not last.empty and "atr" in last.columns:
-            atr = float(last["atr"].iloc[0])
-            price = float(bars["close"].iloc[-1])
-            if price > 0:
-                risk_est = atr / price
-
-        ev = ev_bps(
-            ret_exp,
-            risk_est,
-            float(cfg["backtest"]["fee_bps"]),
-            float(cfg["backtest"]["slippage_bps"]),
-        )
-
-        action = "HOLD"
-        expl = [inst["name"], f"Fuente={ex}:{sym}"]
-        if proba is not None:
-            expl.append(f"Prob(subida)= {proba:.2f}")
-        if ret_exp is not None:
-            expl.append(f"Ret exp ≈ {ret_exp*100:.2f}%")
-        if ev is not None:
-            expl.append(f"EV ≈ {ev:.1f} bps")
-
-        if proba is not None and ret_exp is not None and ev is not None:
-            if proba > 0.60 and ev > 2.0:
-                action = "BUY"
-            elif proba < 0.45 and ev < -2.0:
-                action = "SELL"
-
-        size_eur = sl = tp = None
-        if action == "BUY" and not last.empty and "atr" in last.columns:
-            atr = float(last["atr"].iloc[0])
-            price = float(bars["close"].iloc[-1])
-            size_eur, sl = size_from_atr(
-                capital_eur=float(cfg["signals"]["capital_eur"]),
-                risk_pct=float(cfg["signals"]["risk_per_trade_pct"]),
-                max_pos_pct=float(cfg["signals"]["max_position_pct"]),
-                price=price,
-                atr=atr,
-                sl_atr_mult=float(cfg["signals"]["sl_atr_mult"]),
-            )
-            tp = float(price + float(cfg["signals"]["tp_atr_mult"]) * atr)
-
-        ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
-        scored.append(
-            {
-                "exchange": ex,
-                "symbol": sym,
-                "ts": ts,
-                "action": action,
-                "proba_up": proba,
-                "ret_exp": ret_exp,
-                "risk_est": risk_est,
-                "ev_bps": ev,
-                "size_eur": size_eur,
-                "sl_price": sl,
-                "tp_price": tp,
-                "horizon": f"{int(cfg['ml']['horizon_bars']) * 15}min",
-                "explanation": " | ".join(expl),
-                "model_id": f"{cfg['ml']['model_type']}_{cfg['ml']['horizon_bars']}",
-            }
-        )
-
-    # top EV BUY
-    maxpos = int(cfg["signals"]["max_open_positions"])
-    buys = [r for r in scored if r["action"] == "BUY" and r["ev_bps"] is not None]
-    buys_sorted = sorted(buys, key=lambda r: r["ev_bps"], reverse=True)
-    allowed = set((r["symbol"], r["ts"]) for r in buys_sorted[:maxpos])
-
-    for r in scored:
-        if r["action"] == "BUY" and (r["symbol"], r["ts"]) not in allowed:
-            r["action"] = "HOLD"
-            r["size_eur"] = None
-            r["sl_price"] = None
-            r["tp_price"] = None
-            r["explanation"] = (r["explanation"] + " | No top EV (límite posiciones)")[:2000]
-        upsert_signal(engine, r)
-
-    print("OK:", len(scored), "symbols processed")
+    print(f"OK: {ok} symbols processed")
 
 
 if __name__ == "__main__":
