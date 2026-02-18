@@ -14,8 +14,8 @@ jobs:
           python-version: "3.11"
       - name: Install
         run: pip install -r requirements.txt
-      - name: Run ingest+score
+      - name: Run ingest+score (unbuffered)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-        run: python -m jobs.ingest_score_15m
+        run: python -u -m jobs.ingest_score_15m
