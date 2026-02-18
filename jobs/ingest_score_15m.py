@@ -10,7 +10,6 @@ from core.providers import TwelveDataProvider
 from core.features import compute_features
 from core.ml import train_models, predict
 from core.risk import size_from_atr, ev_bps
-from core.backtest import walk_forward_metrics
 
 
 def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str):
@@ -118,46 +117,19 @@ def upsert_signal(engine, row: dict):
         )
 
 
-def upsert_backtest(engine, exchange: str, symbol: str, m: dict):
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                insert into backtest_summary(exchange,symbol,run_at,sharpe,sortino,max_drawdown,win_rate,profit_factor,trades)
-                values (:exchange,:symbol,now(),:sharpe,:sortino,:max_drawdown,:win_rate,:profit_factor,:trades)
-                on conflict (exchange,symbol) do update set
-                  run_at=excluded.run_at,
-                  sharpe=excluded.sharpe,
-                  sortino=excluded.sortino,
-                  max_drawdown=excluded.max_drawdown,
-                  win_rate=excluded.win_rate,
-                  profit_factor=excluded.profit_factor,
-                  trades=excluded.trades
-                """
-            ),
-            {"exchange": exchange, "symbol": symbol, **m},
-        )
-
-
 def fetch_with_fallback(provider: TwelveDataProvider, cfg: dict, inst: dict):
-    """
-    1) Intenta XETR:símbolo (TR-like)
-    2) Si no hay datos, intenta primary_symbol sin exchange (más fiable)
-    Devuelve: (exchange_label, symbol_used, df)
-    """
     xetr = cfg["data"]["exchange_primary_try"]
     interval = cfg["data"]["interval"]
 
-    # intento 1: Alemania
-    df = provider.fetch_15m(symbol=inst["xetra_symbol"], exchange=xetr, interval=interval, outputsize=5000)
+    # 1) XETR
+    df = provider.fetch_15m(symbol=inst["xetra_symbol"], exchange=xetr, interval=interval, outputsize=800)
     if df is not None and not df.empty:
         return xetr, inst["xetra_symbol"], df
 
     print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando fallback primary...")
 
-    # intento 2: primary (sin exchange)
-    # Twelve Data normalmente acepta símbolos como "LLY", "PG", "GEV", "SBSW", "SQM", "LUN.TO"
-    df2 = provider.fetch_15m(symbol=inst["primary_symbol"], exchange="", interval=interval, outputsize=5000)
+    # 2) Primary (sin exchange)
+    df2 = provider.fetch_15m(symbol=inst["primary_symbol"], exchange="", interval=interval, outputsize=800)
     if df2 is not None and not df2.empty:
         return "PRIMARY", inst["primary_symbol"], df2
 
@@ -178,7 +150,6 @@ def main():
             print(f"[WARN] Sin datos también en fallback para {inst['name']} ({inst['primary_symbol']}). Se omite.")
             continue
 
-        # Guardar barras
         upsert_bars(engine, ex, sym, df, source="twelvedata")
 
         bars = read_bars(engine, ex, sym)
@@ -208,7 +179,12 @@ def main():
             if price > 0:
                 risk_est = atr / price
 
-        ev = ev_bps(ret_exp, risk_est, float(cfg["backtest"]["fee_bps"]), float(cfg["backtest"]["slippage_bps"]))
+        ev = ev_bps(
+            ret_exp,
+            risk_est,
+            float(cfg["backtest"]["fee_bps"]),
+            float(cfg["backtest"]["slippage_bps"]),
+        )
 
         action = "HOLD"
         expl = [inst["name"], f"Fuente={ex}:{sym}"]
@@ -259,10 +235,7 @@ def main():
             }
         )
 
-        bt = walk_forward_metrics(bars, cfg)
-        upsert_backtest(engine, ex, sym, bt)
-
-    # asignación: top EV BUY
+    # top EV BUY
     maxpos = int(cfg["signals"]["max_open_positions"])
     buys = [r for r in scored if r["action"] == "BUY" and r["ev_bps"] is not None]
     buys_sorted = sorted(buys, key=lambda r: r["ev_bps"], reverse=True)
@@ -278,8 +251,6 @@ def main():
         upsert_signal(engine, r)
 
     print("OK:", len(scored), "symbols processed")
-    if len(scored) == 0:
-        print("[WARN] No se procesó ningún símbolo. Twelve Data no devuelve datos ni en XETR ni en fallback primary.")
 
 
 if __name__ == "__main__":
