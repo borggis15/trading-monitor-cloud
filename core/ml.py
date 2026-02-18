@@ -5,10 +5,19 @@ from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoosting
 FEATURES = ["rsi","ema_fast","ema_slow","atr","zscore"]
 
 def train_models(feat: pd.DataFrame, model_type: str, min_rows: int):
-    df = feat.dropna(subset=FEATURES + ["ret_fwd"]).copy()
+    # ✅ Guard: si feat está vacío o no tiene columnas, no entrenar
+    if feat is None or feat.empty:
+        return None, None, 0
+
+    needed = set(FEATURES + ["ret_fwd"])
+    if not needed.issubset(set(feat.columns)):
+        return None, None, 0
+
+    df = feat.dropna(subset=list(needed)).copy()
     n = len(df)
     if n < min_rows:
         return None, None, n
+
     X = df[FEATURES].values
     y_cls = (df["ret_fwd"] > 0).astype(int).values
     y_reg = df["ret_fwd"].values
@@ -20,6 +29,10 @@ def train_models(feat: pd.DataFrame, model_type: str, min_rows: int):
     return clf, reg, n
 
 def predict(clf, reg, feat: pd.DataFrame):
+    if feat is None or feat.empty:
+        return None, None
+    if not set(FEATURES).issubset(set(feat.columns)):
+        return None, None
     last = feat.dropna(subset=FEATURES).tail(1)
     if last.empty:
         return None, None
