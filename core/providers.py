@@ -9,10 +9,6 @@ class TwelveDataProvider:
         self.api_key = api_key or os.environ["TWELVEDATA_API_KEY"]
 
     def fetch_15m(self, symbol: str, exchange: str, interval: str = "15min", outputsize: int = 800) -> pd.DataFrame:
-        """
-        outputsize reducido por defecto para jobs frecuentes (15m).
-        800 velas = ~8-10 días de trading intradía (suficiente para señales rápidas).
-        """
         params = {
             "symbol": symbol,
             "exchange": exchange,
@@ -22,16 +18,14 @@ class TwelveDataProvider:
             "format": "JSON",
         }
 
-        # 2 intentos rápidos
         for attempt in (1, 2):
             try:
-                r = requests.get(self.BASE, params=params, timeout=25)
+                r = requests.get(self.BASE, params=params, timeout=20)
                 r.raise_for_status()
                 data = r.json()
 
                 if "values" not in data:
-                    # Twelve Data suele devolver {"code":..., "message":...} cuando el símbolo no existe
-                    print(f"[WARN] TwelveData sin 'values' para {exchange}:{symbol}. Resp: {str(data)[:200]}")
+                    print(f"[WARN] TwelveData sin 'values' para {exchange}:{symbol}. Resp: {str(data)[:250]}")
                     return pd.DataFrame()
 
                 df = pd.DataFrame(data["values"])
