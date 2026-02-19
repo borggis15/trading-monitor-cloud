@@ -69,8 +69,18 @@ def upsert_signal(engine, row: dict):
         conn.execute(
             text(
                 """
-                insert into public.signals(exchange,symbol,ts,action,proba_up,ret_exp,risk_est,ev_bps,size_eur,sl_price,tp_price,horizon,explanation,model_id)
-                values (:exchange,:symbol,:ts,:action,:proba_up,:ret_exp,:risk_est,:ev_bps,:size_eur,:sl_price,:tp_price,:horizon,:explanation,:model_id)
+                insert into public.signals(
+                  exchange,symbol,ts,
+                  action,proba_up,ret_exp,risk_est,ev_bps,
+                  size_eur,sl_price,tp_price,horizon,explanation,model_id,
+                  asset_id, asset_name
+                )
+                values (
+                  :exchange,:symbol,:ts,
+                  :action,:proba_up,:ret_exp,:risk_est,:ev_bps,
+                  :size_eur,:sl_price,:tp_price,:horizon,:explanation,:model_id,
+                  :asset_id, :asset_name
+                )
                 on conflict (exchange,symbol,ts) do update set
                   action=excluded.action,
                   proba_up=excluded.proba_up,
@@ -82,7 +92,9 @@ def upsert_signal(engine, row: dict):
                   tp_price=excluded.tp_price,
                   horizon=excluded.horizon,
                   explanation=excluded.explanation,
-                  model_id=excluded.model_id
+                  model_id=excluded.model_id,
+                  asset_id=excluded.asset_id,
+                  asset_name=excluded.asset_name
                 """
             ),
             row,
@@ -90,24 +102,15 @@ def upsert_signal(engine, row: dict):
 
 
 def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
-    """
-    Decide qué (exchange,symbol) usar para este inst en scoring:
-    preferimos XETR si existe, si no STOOQ candidate, si no PRIMARY.
-    """
-    candidates = []
-    # XETR ticker
-    candidates.append(("XETR", inst["xetra_symbol"]))
-    # STOOQ candidates
+    candidates = [("XETR", inst["xetra_symbol"])]
     for c in inst.get("stooq_candidates", []) or []:
         candidates.append(("STOOQ", c))
-    # PRIMARY
     candidates.append(("PRIMARY", inst["primary_symbol"]))
 
     for ex, sym in candidates:
         bars = read_bars(engine, ex, sym)
         if bars is not None and not bars.empty:
             return ex, sym
-
     return None, None
 
 
@@ -119,6 +122,9 @@ def main():
 
     for inst in cfg["universe"]:
         name = inst["name"]
+        asset_id = inst.get("isin") or inst.get("asset_id") or name
+        asset_name = name
+
         ex, sym = resolve_series(engine, inst)
         if not ex or not sym:
             print(f"[SCORE SKIP] {name}: sin barras en BD")
@@ -193,6 +199,8 @@ def main():
             "horizon": f"{int(cfg['ml']['horizon_bars'])}d",
             "explanation": explanation,
             "model_id": model_id,
+            "asset_id": asset_id,
+            "asset_name": asset_name,
         })
 
         processed += 1
