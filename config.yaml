@@ -1,9 +1,9 @@
 timezone: Europe/Madrid
 
 data:
-  provider: twelvedata
   interval: 1day
   exchange_primary_try: XETR
+  outputsize: 400
 
 universe:
   - name: Eli Lilly
@@ -11,36 +11,43 @@ universe:
     xetra_symbol: LLY
     primary_symbol: LLY
     primary_exchange: ""
+    stooq_candidates: ["lly.us"]
 
   - name: Sibanye Stillwater
     isin: ZAE000259701
     xetra_symbol: 47V
     primary_symbol: SBSW
     primary_exchange: ""
+    stooq_candidates: ["sbsw.us"]
 
   - name: Lundin Mining
     isin: CA5503721063
     xetra_symbol: GXD
     primary_symbol: LUN
-    primary_exchange: TSX
+    primary_exchange: "XTSE"   # (aunque en Twelve Data free está en Grow)
+    # Stooq candidates (probamos varias convenciones)
+    stooq_candidates: ["lun.ca", "lun.to", "lun"]
 
   - name: GE Vernova
     isin: US36828A1016
     xetra_symbol: Y5C
     primary_symbol: GEV
     primary_exchange: ""
+    stooq_candidates: ["gev.us"]
 
   - name: Procter & Gamble
     isin: US7427181091
     xetra_symbol: PRG
     primary_symbol: PG
     primary_exchange: ""
+    stooq_candidates: ["pg.us"]
 
   - name: SQM ADR
     isin: US8336351056
     xetra_symbol: QYM
     primary_symbol: SQM
     primary_exchange: ""
+    stooq_candidates: ["sqm.us"]
 
 signals:
   capital_eur: 10000
@@ -53,13 +60,9 @@ signals:
 ml:
   enabled: true
   horizon_bars: 5
-  retrain_every_days: 7
   model_type: hgb
   min_train_rows: 200
 
 backtest:
   fee_bps: 1.0
   slippage_bps: 2.0
-  walk_forward:
-    train_days: 365
-    test_days: 90
