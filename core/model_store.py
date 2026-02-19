@@ -31,7 +31,7 @@ def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, met
                     now(),
                     :clf_pickle,
                     :reg_pickle,
-                    :meta::jsonb
+                    CAST(:meta_json AS jsonb)
                 )
                 """
             ),
@@ -41,7 +41,7 @@ def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, met
                 "model_id": model_id,
                 "clf_pickle": clf_b,
                 "reg_pickle": reg_b,
-                "meta": meta_json,
+                "meta_json": meta_json,
             },
         )
 
@@ -68,6 +68,7 @@ def load_latest_models(engine, exchange: str, symbol: str):
     reg = pickle.loads(row.reg_pickle) if row.reg_pickle is not None else None
 
     meta = row.meta
+    # dependiendo del driver puede venir dict ya
     if isinstance(meta, str):
         meta = json.loads(meta)
 
