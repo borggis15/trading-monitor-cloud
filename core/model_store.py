@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import json
 from sqlalchemy import text
 
 
@@ -8,12 +9,30 @@ def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, met
     clf_b = pickle.dumps(clf) if clf is not None else None
     reg_b = pickle.dumps(reg) if reg is not None else None
 
+    meta_json = json.dumps(meta) if meta is not None else None
+
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                insert into public.model_store(exchange, symbol, model_id, trained_at, clf_pickle, reg_pickle, meta)
-                values (:exchange, :symbol, :model_id, now(), :clf_pickle, :reg_pickle, :meta)
+                insert into public.model_store(
+                    exchange,
+                    symbol,
+                    model_id,
+                    trained_at,
+                    clf_pickle,
+                    reg_pickle,
+                    meta
+                )
+                values (
+                    :exchange,
+                    :symbol,
+                    :model_id,
+                    now(),
+                    :clf_pickle,
+                    :reg_pickle,
+                    :meta::jsonb
+                )
                 """
             ),
             {
@@ -22,7 +41,7 @@ def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, met
                 "model_id": model_id,
                 "clf_pickle": clf_b,
                 "reg_pickle": reg_b,
-                "meta": meta,
+                "meta": meta_json,
             },
         )
 
@@ -47,4 +66,13 @@ def load_latest_models(engine, exchange: str, symbol: str):
 
     clf = pickle.loads(row.clf_pickle) if row.clf_pickle is not None else None
     reg = pickle.loads(row.reg_pickle) if row.reg_pickle is not None else None
-    return clf, reg, {"model_id": row.model_id, "trained_at": str(row.trained_at), "meta": row.meta}
+
+    meta = row.meta
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+
+    return clf, reg, {
+        "model_id": row.model_id,
+        "trained_at": str(row.trained_at),
+        "meta": meta,
+    }
