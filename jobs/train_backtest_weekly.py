@@ -36,15 +36,28 @@ def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
 
 
 def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
-    candidates = [("XETR", inst["xetra_symbol"])]
+    candidates = []
+
+    # XETR primero
+    candidates.append(("XETR", inst["xetra_symbol"]))
+
+    # STOOQ candidates
     for c in inst.get("stooq_candidates", []) or []:
         candidates.append(("STOOQ", c))
+
+    # ✅ YAHOO candidates (nuevo)
+    for y in inst.get("yahoo_candidates", []) or []:
+        candidates.append(("YAHOO", y))
+
+    # PRIMARY último
     candidates.append(("PRIMARY", inst["primary_symbol"]))
 
     for ex, sym in candidates:
         bars = read_bars(engine, ex, sym)
         if bars is not None and not bars.empty:
+            print(f"[SERIES] {inst['name']} usando {ex}:{sym} bars={len(bars)}")
             return ex, sym
+
     return None, None
 
 
@@ -100,7 +113,7 @@ def compute_walk_forward_metrics(
         proba, ret_exp = predict(clf, reg, test)
 
         atr = float(test["atr"].iloc[0]) if np.isfinite(test["atr"].iloc[0]) else None
-        risk_est = 0.02 if atr else None  # fallback conservador
+        risk_est = 0.02 if atr else None
 
         ev = ev_bps(ret_exp, risk_est, fee_bps, slippage_bps)
 
@@ -182,7 +195,7 @@ def insert_metrics(engine, exchange: str, symbol: str, model_id: str, trained_at
                 "exchange": exchange,
                 "symbol": symbol,
                 "model_id": model_id,
-                "trained_at": trained_at,  # datetime real
+                "trained_at": trained_at,
                 "horizon": horizon,
                 "n_test": m.get("n_test"),
                 "hit_rate": m.get("hit_rate"),
@@ -242,7 +255,6 @@ def main():
 
         print(f"[METRICS OK] {name} {ex}:{sym} n_test={m.get('n_test')} sharpe={m.get('sharpe')} notes={m.get('notes')}")
 
-    # log final
     with engine.begin() as conn:
         c = conn.execute(text("select count(*) from public.model_metrics")).scalar()
 
