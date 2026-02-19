@@ -13,31 +13,18 @@ from core.risk import size_from_atr, ev_bps
 
 
 def _normalize_ts_index(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Asegura que el DataFrame tenga:
-      - índice datetime UTC
-      - nombre de índice = 'ts'
-    Compatible con Twelve Data (ya viene bien) y Stooq (suele venir con índice fecha sin nombre).
-    """
     if df is None or df.empty:
         return df
-
     out = df.copy()
-
-    # Si ya tiene índice datetime, perfecto
     if not isinstance(out.index, pd.DatetimeIndex):
-        # Si existe una columna con fecha típica, la usamos
-        for col in ["ts", "datetime", "date", "Date", "time", "Time"]:
+        for col in ["ts", "datetime", "date", "Date"]:
             if col in out.columns:
                 out[col] = pd.to_datetime(out[col], utc=True, errors="coerce")
                 out = out.dropna(subset=[col]).set_index(col)
                 break
-
-    # Forzamos DatetimeIndex
     if not isinstance(out.index, pd.DatetimeIndex):
         out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
         out = out[~out.index.isna()]
-
     out = out.sort_index()
     out.index.name = "ts"
     return out
@@ -46,19 +33,16 @@ def _normalize_ts_index(df: pd.DataFrame) -> pd.DataFrame:
 def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str):
     if df is None or df.empty:
         return 0
-
     df = _normalize_ts_index(df)
     if df is None or df.empty:
         return 0
 
-    d = df.copy().reset_index()  # ahora seguro existe columna ts
+    d = df.reset_index()
     d["ts"] = pd.to_datetime(d["ts"], utc=True)
-
     d["exchange"] = exchange
     d["symbol"] = symbol
     d["source"] = source
 
-    # asegurar columnas
     for c in ["open", "high", "low", "close", "volume"]:
         if c not in d.columns:
             d[c] = pd.NA
@@ -110,7 +94,7 @@ def upsert_features(engine, exchange: str, symbol: str, feat: pd.DataFrame):
     if feat is None or feat.empty:
         return 0
 
-    f = feat.copy().reset_index()
+    f = feat.reset_index()
     f["ts"] = pd.to_datetime(f["ts"], utc=True)
     f["exchange"] = exchange
     f["symbol"] = symbol
@@ -165,34 +149,39 @@ def upsert_signal(engine, row: dict):
         )
 
 
-def fetch_best(provider: MarketDataProvider, cfg: dict, inst: dict):
+def fetch_inst(provider: MarketDataProvider, cfg: dict, inst: dict):
     interval = cfg["data"]["interval"]
     out = int(cfg["data"].get("outputsize", 400))
     xetr = cfg["data"]["exchange_primary_try"]
 
-    df = provider.fetch(
-        symbol=inst["xetra_symbol"],
-        exchange=xetr,
+    # 1) Intento XETR (TD) -> si falla, stooq
+    df, src, used = provider.fetch_best(
+        td_symbol=inst["xetra_symbol"],
+        td_exchange=xetr,
         interval=interval,
         outputsize=out,
         stooq_candidates=inst.get("stooq_candidates", []),
     )
     if df is not None and not df.empty:
-        return xetr, inst["xetra_symbol"], df, "mixed"
+        if src == "stooq":
+            return "STOOQ", used, df, "stooq"
+        return xetr, inst["xetra_symbol"], df, "twelvedata"
 
     print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando primary...")
 
+    # 2) Intento primary (TD) -> si falla, stooq
     pex = inst.get("primary_exchange", "") or ""
-    df2 = provider.fetch(
-        symbol=inst["primary_symbol"],
-        exchange=pex,
+    df2, src2, used2 = provider.fetch_best(
+        td_symbol=inst["primary_symbol"],
+        td_exchange=pex,
         interval=interval,
         outputsize=out,
         stooq_candidates=inst.get("stooq_candidates", []),
     )
     if df2 is not None and not df2.empty:
-        ex_label = pex if pex else "PRIMARY"
-        return ex_label, inst["primary_symbol"], df2, "mixed"
+        if src2 == "stooq":
+            return "STOOQ", used2, df2, "stooq"
+        return ("PRIMARY" if not pex else pex), inst["primary_symbol"], df2, "twelvedata"
 
     return None, None, pd.DataFrame(), ""
 
@@ -203,17 +192,15 @@ def main():
     engine = get_engine()
 
     processed = 0
-
     for inst in cfg["universe"]:
         name = inst["name"]
         print(f"[START] {name}")
 
-        ex, sym, df, source = fetch_best(provider, cfg, inst)
+        ex, sym, df, source = fetch_inst(provider, cfg, inst)
         if df is None or df.empty or ex is None or sym is None:
             print(f"[SKIP] {name}: sin datos")
             continue
 
-        df = _normalize_ts_index(df)
         n = upsert_bars(engine, ex, sym, df, source=source)
         print(f"[INFO] {name}: bars {ex}:{sym} -> {n} filas")
 
@@ -226,7 +213,6 @@ def main():
         if feat is None or feat.empty:
             print(f"[SKIP] {name}: features vacío")
             continue
-
         upsert_features(engine, ex, sym, feat)
 
         clf, reg, train_rows = train_models(
@@ -244,12 +230,7 @@ def main():
             if price > 0:
                 risk_est = atr / price
 
-        ev = ev_bps(
-            ret_exp,
-            risk_est,
-            float(cfg["backtest"]["fee_bps"]),
-            float(cfg["backtest"]["slippage_bps"]),
-        )
+        ev = ev_bps(ret_exp, risk_est, float(cfg["backtest"]["fee_bps"]), float(cfg["backtest"]["slippage_bps"]))
 
         action = "HOLD"
         expl = [name, f"Fuente={ex}:{sym}", f"interval={cfg['data']['interval']}"]
