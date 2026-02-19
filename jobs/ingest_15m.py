@@ -73,36 +73,51 @@ def main():
         name = inst["name"]
         print(f"[INGEST] {name}")
 
-        # intento XETR (TD->STOOQ)
+        stooq_c = inst.get("stooq_candidates", []) or []
+        yahoo_c = inst.get("yahoo_candidates", []) or []
+
+        # intento XETR (TD->STOOQ->YAHOO)
         df, src, used = provider.fetch_best(
             td_symbol=inst["xetra_symbol"],
             td_exchange=xetr,
             interval=interval,
             outputsize=out,
-            stooq_candidates=inst.get("stooq_candidates", []),
+            stooq_candidates=stooq_c,
+            yahoo_candidates=yahoo_c,
         )
         if df is not None and not df.empty:
-            ex = "STOOQ" if src == "stooq" else xetr
-            sym = used if src == "stooq" else inst["xetra_symbol"]
+            if src == "stooq":
+                ex, sym = "STOOQ", used
+            elif src == "yahoo":
+                ex, sym = "YAHOO", used
+            else:
+                ex, sym = xetr, inst["xetra_symbol"]
+
             n = upsert_bars(engine, ex, sym, df, source=src)
-            print(f"[OK] {name}: {ex}:{sym} {n} filas")
+            print(f"[OK] {name}: {ex}:{sym} {n} filas ({src})")
             processed += 1
             continue
 
-        # intento primary (TD->STOOQ)
+        # intento primary (TD->STOOQ->YAHOO)
         pex = inst.get("primary_exchange", "") or ""
         df2, src2, used2 = provider.fetch_best(
             td_symbol=inst["primary_symbol"],
             td_exchange=pex,
             interval=interval,
             outputsize=out,
-            stooq_candidates=inst.get("stooq_candidates", []),
+            stooq_candidates=stooq_c,
+            yahoo_candidates=yahoo_c,
         )
         if df2 is not None and not df2.empty:
-            ex = "STOOQ" if src2 == "stooq" else ("PRIMARY" if not pex else pex)
-            sym = used2 if src2 == "stooq" else inst["primary_symbol"]
+            if src2 == "stooq":
+                ex, sym = "STOOQ", used2
+            elif src2 == "yahoo":
+                ex, sym = "YAHOO", used2
+            else:
+                ex, sym = ("PRIMARY" if not pex else pex), inst["primary_symbol"]
+
             n = upsert_bars(engine, ex, sym, df2, source=src2)
-            print(f"[OK] {name}: {ex}:{sym} {n} filas")
+            print(f"[OK] {name}: {ex}:{sym} {n} filas ({src2})")
             processed += 1
             continue
 
