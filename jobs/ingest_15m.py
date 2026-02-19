@@ -11,10 +11,17 @@ from core.providers import MarketDataProvider
 def _normalize_ts_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
+
     out = df.copy()
+
+    # ✅ FIX: aplanar MultiIndex de columnas si existiera
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [c[0] for c in out.columns]
+
     if not isinstance(out.index, pd.DatetimeIndex):
         out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
         out = out[~out.index.isna()]
+
     out = out.sort_index()
     out.index.name = "ts"
     return out
@@ -29,6 +36,11 @@ def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: st
         return 0
 
     d = df.reset_index()
+
+    # ✅ FIX: aplanar MultiIndex tras reset_index si existiera
+    if isinstance(d.columns, pd.MultiIndex):
+        d.columns = [c[0] for c in d.columns]
+
     d["ts"] = pd.to_datetime(d["ts"], utc=True)
     d["exchange"] = exchange
     d["symbol"] = symbol
@@ -37,6 +49,10 @@ def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: st
     for c in ["open", "high", "low", "close", "volume"]:
         if c not in d.columns:
             d[c] = pd.NA
+        else:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    payload = d[["exchange", "symbol", "ts", "open", "high", "low", "close", "volume", "source"]].to_dict(orient="records")
 
     with engine.begin() as conn:
         conn.execute(
@@ -53,9 +69,9 @@ def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: st
                   source=excluded.source
                 """
             ),
-            d[["exchange","symbol","ts","open","high","low","close","volume","source"]].to_dict(orient="records"),
+            payload,
         )
-    return len(d)
+    return len(payload)
 
 
 def main():
