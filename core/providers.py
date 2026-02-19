@@ -35,7 +35,6 @@ class TwelveDataProvider:
 
                 df = pd.DataFrame(data["values"])
                 if df.empty:
-                    print(f"[WARN] TwelveData values vacío para {exchange}:{symbol}.")
                     return pd.DataFrame()
 
                 df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
@@ -61,9 +60,7 @@ class StooqProvider:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        df = df.rename(
-            columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-        )
+        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
         df.index = pd.to_datetime(df.index, utc=True)
         df = df.sort_index()
 
@@ -91,15 +88,14 @@ class MarketDataProvider:
         stooq_candidates: list[str] | None = None,
     ) -> tuple[pd.DataFrame, str, str]:
         """
-        Devuelve: (df, source, used_symbol)
+        Returns: (df, source, used_symbol)
           source: 'twelvedata' | 'stooq' | 'none'
-          used_symbol: símbolo que se usó realmente (para stooq)
         """
         df = self.td.fetch(symbol=td_symbol, exchange=td_exchange, interval=interval, outputsize=outputsize)
         if df is not None and not df.empty:
             return df, "twelvedata", td_symbol
 
-        # fallback stooq solo si interval es daily
+        # stooq solo para daily/weekly/monthly
         if interval not in ("1day", "1week", "1month"):
             return pd.DataFrame(), "none", ""
 
@@ -110,6 +106,5 @@ class MarketDataProvider:
                     return df2, "stooq", c
             except Exception as e:
                 print(f"[WARN] Stooq fallo para {c}: {e}")
-                continue
 
         return pd.DataFrame(), "none", ""
