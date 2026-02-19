@@ -25,7 +25,8 @@ universe:
     xetra_symbol: GXD
     primary_symbol: LUN
     primary_exchange: "XTSE"
-    stooq_candidates: ["lun.ca", "lun.to", "lun"]
+    # Ampliamos candidates para encontrar uno que exista en Stooq
+    stooq_candidates: ["lun.ca", "lun.to", "lumnf.us", "lumnf", "lun", "lundin"]
 
   - name: GE Vernova
     isin: US36828A1016
