@@ -6,13 +6,10 @@ from datetime import datetime, timezone
 
 from core.config import load_config
 from core.db import get_engine
-from core.providers import TwelveDataProvider
+from core.providers import MarketDataProvider
 from core.features import compute_features
 from core.ml import train_models, predict
 from core.risk import size_from_atr, ev_bps
-
-
-OUTPUTSIZE_DAILY = 400  # ✅ mucho más rápido que 1200
 
 
 def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str):
@@ -120,29 +117,44 @@ def upsert_signal(engine, row: dict):
         )
 
 
-def fetch_with_fallback(provider: TwelveDataProvider, cfg: dict, inst: dict):
-    xetr = cfg["data"]["exchange_primary_try"]
+def fetch_best(provider: MarketDataProvider, cfg: dict, inst: dict):
     interval = cfg["data"]["interval"]
+    out = int(cfg["data"].get("outputsize", 400))
+    xetr = cfg["data"]["exchange_primary_try"]
 
-    # intento 1: XETR
-    df = provider.fetch_15m(symbol=inst["xetra_symbol"], exchange=xetr, interval=interval, outputsize=OUTPUTSIZE_DAILY)
+    # 1) XETR
+    df = provider.fetch(
+        symbol=inst["xetra_symbol"],
+        exchange=xetr,
+        interval=interval,
+        outputsize=out,
+        stooq_candidates=inst.get("stooq_candidates", []),
+    )
     if df is not None and not df.empty:
-        return xetr, inst["xetra_symbol"], df
+        return xetr, inst["xetra_symbol"], df, "twelvedata"
 
-    print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando fallback primary...")
+    print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando primary...")
 
-    # intento 2: primary con exchange opcional
+    # 2) primary (twelvedata) + si falla, stooq_candidates
     pex = inst.get("primary_exchange", "") or ""
-    df2 = provider.fetch_15m(symbol=inst["primary_symbol"], exchange=pex, interval=interval, outputsize=OUTPUTSIZE_DAILY)
+    df2 = provider.fetch(
+        symbol=inst["primary_symbol"],
+        exchange=pex,
+        interval=interval,
+        outputsize=out,
+        stooq_candidates=inst.get("stooq_candidates", []),
+    )
     if df2 is not None and not df2.empty:
-        return (pex if pex else "PRIMARY"), inst["primary_symbol"], df2
+        ex_label = pex if pex else "PRIMARY"
+        # si ha venido por stooq, el provider ya habrá hecho fallback; no lo distinguimos aquí
+        return ex_label, inst["primary_symbol"], df2, "mixed"
 
-    return None, None, pd.DataFrame()
+    return None, None, pd.DataFrame(), ""
 
 
 def main():
     cfg = load_config()
-    provider = TwelveDataProvider()
+    provider = MarketDataProvider()
     engine = get_engine()
 
     processed = 0
@@ -151,12 +163,12 @@ def main():
         name = inst["name"]
         print(f"[START] {name}")
 
-        ex, sym, df = fetch_with_fallback(provider, cfg, inst)
+        ex, sym, df, source = fetch_best(provider, cfg, inst)
         if df is None or df.empty or ex is None or sym is None:
             print(f"[SKIP] {name}: sin datos")
             continue
 
-        n = upsert_bars(engine, ex, sym, df, source="twelvedata")
+        n = upsert_bars(engine, ex, sym, df, source=source)
         print(f"[INFO] {name}: bars {ex}:{sym} -> {n} filas")
 
         bars = read_bars(engine, ex, sym)
@@ -201,8 +213,6 @@ def main():
             expl.append(f"Ret exp ≈ {ret_exp*100:.2f}%")
         if ev is not None:
             expl.append(f"EV ≈ {ev:.1f} bps")
-        if train_rows < int(cfg["ml"]["min_train_rows"]):
-            expl.append(f"ML no entrenado (rows={train_rows})")
 
         if proba is not None and ret_exp is not None and ev is not None:
             if proba > 0.60 and ev > 2.0:
