@@ -12,6 +12,13 @@ from core.risk import size_from_atr, ev_bps
 from core.model_store import load_latest_models
 
 
+# Umbrales de robustez (ajustables)
+ROBUST_MIN_NTEST = 60
+ROBUST_MIN_SHARPE = 1.0
+ROBUST_MIN_HITRATE = 0.52
+ROBUST_MAX_DD_FLOOR = -0.35  # no permitir BUY si el drawdown fue peor que -35%
+
+
 def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
     df = pd.read_sql(
         text(
@@ -29,6 +36,26 @@ def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
         return df
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     return df.set_index("ts").sort_index()
+
+
+def read_latest_metrics(engine, exchange: str, symbol: str):
+    row = pd.read_sql(
+        text(
+            """
+            select sharpe, max_dd, hit_rate, profit_factor, n_test, trained_at, model_id
+            from public.model_metrics
+            where exchange=:exchange and symbol=:symbol
+            order by trained_at desc
+            limit 1
+            """
+        ),
+        engine,
+        params={"exchange": exchange, "symbol": symbol},
+    )
+    if row.empty:
+        return None
+    r = row.iloc[0].to_dict()
+    return r
 
 
 def upsert_features(engine, exchange: str, symbol: str, feat: pd.DataFrame):
@@ -114,6 +141,34 @@ def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
+def robust_ok_for_buy(m: dict | None) -> tuple[bool, str]:
+    if not m:
+        return False, "sin métricas"
+
+    n_test = m.get("n_test")
+    sharpe = m.get("sharpe")
+    max_dd = m.get("max_dd")
+    hit = m.get("hit_rate")
+
+    reasons = []
+    ok = True
+
+    if n_test is None or int(n_test) < ROBUST_MIN_NTEST:
+        ok = False
+        reasons.append(f"n_test<{ROBUST_MIN_NTEST}")
+    if sharpe is None or float(sharpe) < ROBUST_MIN_SHARPE:
+        ok = False
+        reasons.append(f"sharpe<{ROBUST_MIN_SHARPE}")
+    if hit is None or float(hit) < ROBUST_MIN_HITRATE:
+        ok = False
+        reasons.append(f"hit_rate<{ROBUST_MIN_HITRATE}")
+    if max_dd is None or float(max_dd) < ROBUST_MAX_DD_FLOOR:
+        ok = False
+        reasons.append(f"max_dd<{ROBUST_MAX_DD_FLOOR}")
+
+    return ok, ("ok" if ok else ", ".join(reasons))
+
+
 def main():
     cfg = load_config()
     engine = get_engine()
@@ -141,8 +196,8 @@ def main():
         clf, reg, meta = load_latest_models(engine, ex, sym)
         proba, ret_exp = predict(clf, reg, feat)
 
-        risk_est = None
         last = feat.dropna().tail(1)
+        risk_est = None
         if not last.empty and "atr" in last.columns:
             atr = float(last["atr"].iloc[0])
             price = float(bars["close"].iloc[-1])
@@ -156,12 +211,19 @@ def main():
             float(cfg["backtest"]["slippage_bps"]),
         )
 
+        # Señal base
         action = "HOLD"
         if proba is not None and ret_exp is not None and ev is not None:
             if proba > 0.60 and ev > 2.0:
                 action = "BUY"
             elif proba < 0.45 and ev < -2.0:
                 action = "SELL"
+
+        # Filtro robustez SOLO para BUY (long-only conservador)
+        m = read_latest_metrics(engine, ex, sym)
+        ok_buy, ok_reason = robust_ok_for_buy(m)
+        if action == "BUY" and not ok_buy:
+            action = "HOLD"
 
         size_eur = sl = tp = None
         if action == "BUY" and not last.empty and "atr" in last.columns:
@@ -180,9 +242,19 @@ def main():
         ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
         model_id = meta["model_id"] if meta else "no_model"
 
-        explanation = f"{name} | serie={ex}:{sym} | model={model_id}"
-        if meta and meta.get("trained_at"):
-            explanation += f" | trained_at={meta['trained_at']}"
+        expl = [
+            f"{name}",
+            f"serie={ex}:{sym}",
+            f"model={model_id}",
+            f"proba={None if proba is None else round(float(proba),3)}",
+            f"ret_exp={None if ret_exp is None else round(float(ret_exp),4)}",
+            f"ev_bps={None if ev is None else round(float(ev),2)}",
+        ]
+        if m:
+            expl.append(
+                f"robust(n={m.get('n_test')},sh={round(float(m.get('sharpe')),2)},dd={round(float(m.get('max_dd')),2)},hit={round(float(m.get('hit_rate')),2)})"
+            )
+        expl.append(f"buy_gate={ok_reason}")
 
         upsert_signal(engine, {
             "exchange": ex,
@@ -197,14 +269,14 @@ def main():
             "sl_price": sl,
             "tp_price": tp,
             "horizon": f"{int(cfg['ml']['horizon_bars'])}d",
-            "explanation": explanation,
+            "explanation": " | ".join(expl),
             "model_id": model_id,
             "asset_id": asset_id,
             "asset_name": asset_name,
         })
 
         processed += 1
-        print(f"[SCORE OK] {name} -> {action} ({ex}:{sym})")
+        print(f"[SCORE OK] {name} -> {action} ({ex}:{sym}) gate={ok_reason}")
 
     print(f"SCORE OK: {processed} inst")
 
