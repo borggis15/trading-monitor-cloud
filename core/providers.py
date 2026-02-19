@@ -4,8 +4,6 @@ import os
 import time
 import requests
 import pandas as pd
-
-# Stooq via pandas-datareader (gratis EOD)
 from pandas_datareader import data as pdr
 
 
@@ -25,17 +23,14 @@ class TwelveDataProvider:
             "format": "JSON",
         }
 
-        # 2 intentos rápidos
         for attempt in (1, 2):
             try:
                 r = requests.get(self.BASE, params=params, timeout=20)
                 r.raise_for_status()
                 data = r.json()
 
-                # Si no hay 'values', Twelve Data devuelve error con code/message
                 if "values" not in data:
-                    msg = str(data)[:300]
-                    print(f"[WARN] TwelveData sin 'values' para {exchange}:{symbol}. Resp: {msg}")
+                    print(f"[WARN] TwelveData sin 'values' para {exchange}:{symbol}. Resp: {str(data)[:250]}")
                     return pd.DataFrame()
 
                 df = pd.DataFrame(data["values"])
@@ -61,74 +56,60 @@ class TwelveDataProvider:
 
 
 class StooqProvider:
-    """
-    Stooq (gratis) – funciona muy bien para daily.
-    Usamos pandas-datareader StooqDailyReader (EOD).
-    """
+    def fetch_daily(self, candidate: str, outputsize: int = 400) -> pd.DataFrame:
+        df = pdr.DataReader(candidate, "stooq")
+        if df is None or df.empty:
+            return pd.DataFrame()
 
-    def fetch_daily_candidates(self, candidates: list[str], outputsize: int = 800) -> pd.DataFrame:
-        # Stooq devuelve el índice como fecha, columnas Open/High/Low/Close/Volume
-        # (a veces en orden descendente), lo normalizamos.
-        for s in candidates:
-            try:
-                df = pdr.DataReader(s, "stooq")
-                if df is None or df.empty:
-                    continue
+        df = df.rename(
+            columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+        )
+        df.index = pd.to_datetime(df.index, utc=True)
+        df = df.sort_index()
 
-                # normaliza columnas y orden
-                df = df.rename(
-                    columns={
-                        "Open": "open",
-                        "High": "high",
-                        "Low": "low",
-                        "Close": "close",
-                        "Volume": "volume",
-                    }
-                )
-                df.index = pd.to_datetime(df.index, utc=True)
-                df = df.sort_index()
+        if outputsize and len(df) > int(outputsize):
+            df = df.tail(int(outputsize))
 
-                # recorta a outputsize
-                if outputsize and len(df) > outputsize:
-                    df = df.tail(int(outputsize))
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c not in df.columns:
+                df[c] = pd.NA
 
-                # asegurar columnas
-                cols = ["open", "high", "low", "close", "volume"]
-                for c in cols:
-                    if c not in df.columns:
-                        df[c] = pd.NA
-                return df[cols]
-
-            except Exception as e:
-                print(f"[WARN] Stooq fallo para {s}: {e}")
-                continue
-
-        return pd.DataFrame()
+        return df[["open", "high", "low", "close", "volume"]]
 
 
 class MarketDataProvider:
-    """
-    Provider unificado:
-      - intenta Twelve Data
-      - si falla, intenta Stooq (daily)
-    """
-
     def __init__(self):
         self.td = TwelveDataProvider()
         self.stooq = StooqProvider()
 
-    def fetch(self, symbol: str, exchange: str, interval: str, outputsize: int, stooq_candidates: list[str] | None = None) -> pd.DataFrame:
-        df = self.td.fetch(symbol=symbol, exchange=exchange, interval=interval, outputsize=outputsize)
+    def fetch_best(
+        self,
+        td_symbol: str,
+        td_exchange: str,
+        interval: str,
+        outputsize: int,
+        stooq_candidates: list[str] | None = None,
+    ) -> tuple[pd.DataFrame, str, str]:
+        """
+        Devuelve: (df, source, used_symbol)
+          source: 'twelvedata' | 'stooq' | 'none'
+          used_symbol: símbolo que se usó realmente (para stooq)
+        """
+        df = self.td.fetch(symbol=td_symbol, exchange=td_exchange, interval=interval, outputsize=outputsize)
         if df is not None and not df.empty:
-            return df
+            return df, "twelvedata", td_symbol
 
-        # fallback stooq SOLO tiene sentido para daily
+        # fallback stooq solo si interval es daily
         if interval not in ("1day", "1week", "1month"):
-            return pd.DataFrame()
+            return pd.DataFrame(), "none", ""
 
-        candidates = stooq_candidates or []
-        if not candidates:
-            return pd.DataFrame()
+        for c in (stooq_candidates or []):
+            try:
+                df2 = self.stooq.fetch_daily(c, outputsize=outputsize)
+                if df2 is not None and not df2.empty:
+                    return df2, "stooq", c
+            except Exception as e:
+                print(f"[WARN] Stooq fallo para {c}: {e}")
+                continue
 
-        df2 = self.stooq.fetch_daily_candidates(candidates, outputsize=outputsize)
-        return df2
+        return pd.DataFrame(), "none", ""
