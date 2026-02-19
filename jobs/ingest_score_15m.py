@@ -12,15 +12,56 @@ from core.ml import train_models, predict
 from core.risk import size_from_atr, ev_bps
 
 
+def _normalize_ts_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Asegura que el DataFrame tenga:
+      - índice datetime UTC
+      - nombre de índice = 'ts'
+    Compatible con Twelve Data (ya viene bien) y Stooq (suele venir con índice fecha sin nombre).
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    # Si ya tiene índice datetime, perfecto
+    if not isinstance(out.index, pd.DatetimeIndex):
+        # Si existe una columna con fecha típica, la usamos
+        for col in ["ts", "datetime", "date", "Date", "time", "Time"]:
+            if col in out.columns:
+                out[col] = pd.to_datetime(out[col], utc=True, errors="coerce")
+                out = out.dropna(subset=[col]).set_index(col)
+                break
+
+    # Forzamos DatetimeIndex
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+        out = out[~out.index.isna()]
+
+    out = out.sort_index()
+    out.index.name = "ts"
+    return out
+
+
 def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str):
     if df is None or df.empty:
         return 0
 
-    d = df.copy().reset_index()
+    df = _normalize_ts_index(df)
+    if df is None or df.empty:
+        return 0
+
+    d = df.copy().reset_index()  # ahora seguro existe columna ts
     d["ts"] = pd.to_datetime(d["ts"], utc=True)
+
     d["exchange"] = exchange
     d["symbol"] = symbol
     d["source"] = source
+
+    # asegurar columnas
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in d.columns:
+            d[c] = pd.NA
 
     with engine.begin() as conn:
         conn.execute(
@@ -37,7 +78,7 @@ def upsert_bars(engine, exchange: str, symbol: str, df: pd.DataFrame, source: st
                   source=excluded.source
                 """
             ),
-            d.to_dict(orient="records"),
+            d[["exchange","symbol","ts","open","high","low","close","volume","source"]].to_dict(orient="records"),
         )
     return len(d)
 
@@ -65,12 +106,19 @@ def upsert_features(engine, exchange: str, symbol: str, feat: pd.DataFrame):
     if feat is None or feat.empty:
         return 0
 
+    feat = _normalize_ts_index(feat)
+    if feat is None or feat.empty:
+        return 0
+
     f = feat.copy().reset_index()
     f["ts"] = pd.to_datetime(f["ts"], utc=True)
     f["exchange"] = exchange
     f["symbol"] = symbol
 
     cols = ["exchange", "symbol", "ts", "rsi", "ema_fast", "ema_slow", "atr", "zscore", "ret_fwd"]
+    for c in cols:
+        if c not in f.columns:
+            f[c] = pd.NA
 
     with engine.begin() as conn:
         conn.execute(
@@ -122,7 +170,6 @@ def fetch_best(provider: MarketDataProvider, cfg: dict, inst: dict):
     out = int(cfg["data"].get("outputsize", 400))
     xetr = cfg["data"]["exchange_primary_try"]
 
-    # 1) XETR
     df = provider.fetch(
         symbol=inst["xetra_symbol"],
         exchange=xetr,
@@ -131,11 +178,10 @@ def fetch_best(provider: MarketDataProvider, cfg: dict, inst: dict):
         stooq_candidates=inst.get("stooq_candidates", []),
     )
     if df is not None and not df.empty:
-        return xetr, inst["xetra_symbol"], df, "twelvedata"
+        return xetr, inst["xetra_symbol"], df, "mixed"
 
     print(f"[WARN] Sin datos para {xetr}:{inst['xetra_symbol']}. Probando primary...")
 
-    # 2) primary (twelvedata) + si falla, stooq_candidates
     pex = inst.get("primary_exchange", "") or ""
     df2 = provider.fetch(
         symbol=inst["primary_symbol"],
@@ -146,7 +192,6 @@ def fetch_best(provider: MarketDataProvider, cfg: dict, inst: dict):
     )
     if df2 is not None and not df2.empty:
         ex_label = pex if pex else "PRIMARY"
-        # si ha venido por stooq, el provider ya habrá hecho fallback; no lo distinguimos aquí
         return ex_label, inst["primary_symbol"], df2, "mixed"
 
     return None, None, pd.DataFrame(), ""
@@ -168,6 +213,7 @@ def main():
             print(f"[SKIP] {name}: sin datos")
             continue
 
+        df = _normalize_ts_index(df)
         n = upsert_bars(engine, ex, sym, df, source=source)
         print(f"[INFO] {name}: bars {ex}:{sym} -> {n} filas")
 
