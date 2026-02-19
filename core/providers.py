@@ -4,7 +4,6 @@ import os
 import time
 import requests
 import pandas as pd
-from pandas_datareader import data as pdr
 import yfinance as yf
 
 
@@ -59,28 +58,57 @@ class TwelveDataProvider:
 
 
 class StooqProvider:
+    """
+    Stooq CSV endpoint:
+      https://stooq.com/q/d/l/?s=SYMBOL&i=d
+    Ejemplo: s=pg.us
+    """
+    BASE = "https://stooq.com/q/d/l/"
+
     def fetch_daily(self, candidate: str, outputsize: int = 400) -> pd.DataFrame:
-        df = pdr.DataReader(candidate, "stooq")
-        if df is None or df.empty:
+        try:
+            r = requests.get(self.BASE, params={"s": candidate, "i": "d"}, timeout=20)
+            r.raise_for_status()
+            txt = r.text
+        except Exception:
             return pd.DataFrame()
 
-        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        df.index = pd.to_datetime(df.index, utc=True)
-        df = df.sort_index()
+        if not txt or "Date,Open,High,Low,Close" not in txt:
+            return pd.DataFrame()
 
-        if outputsize and len(df) > int(outputsize):
-            df = df.tail(int(outputsize))
+        from io import StringIO
+        df = pd.read_csv(StringIO(txt))
+        if df is None or df.empty or "Date" not in df.columns:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date")
+        df = df.rename(
+            columns={
+                "Date": "ts",
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+            }
+        )
 
         for c in ["open", "high", "low", "close", "volume"]:
-            if c not in df.columns:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            else:
                 df[c] = pd.NA
+
+        df = df.set_index("ts")
+        if outputsize and len(df) > int(outputsize):
+            df = df.tail(int(outputsize))
 
         return df[["open", "high", "low", "close", "volume"]]
 
 
 class YahooProvider:
     def fetch_daily(self, ticker: str, outputsize: int = 400) -> pd.DataFrame:
-        # yfinance: interval 1d, periodo amplio y luego recortamos
         try:
             df = yf.download(ticker, period="5y", interval="1d", auto_adjust=False, progress=False)
         except Exception:
@@ -89,10 +117,9 @@ class YahooProvider:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # columnas suelen ser: Open High Low Close Adj Close Volume
         df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        df.index = pd.to_datetime(df.index, utc=True)
-        df = df.sort_index()
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        df = df[~df.index.isna()].sort_index()
 
         if outputsize and len(df) > int(outputsize):
             df = df.tail(int(outputsize))
@@ -123,28 +150,19 @@ class MarketDataProvider:
         Returns: (df, source, used_symbol)
           source: 'twelvedata' | 'stooq' | 'yahoo' | 'none'
         """
-        # 1) TwelveData
         df = self.td.fetch(symbol=td_symbol, exchange=td_exchange, interval=interval, outputsize=outputsize)
         if df is not None and not df.empty:
             return df, "twelvedata", td_symbol
 
-        # 2) Stooq (solo para daily)
         if interval in ("1day", "1week", "1month"):
             for c in (stooq_candidates or []):
-                try:
-                    df2 = self.stooq.fetch_daily(c, outputsize=outputsize)
-                    if df2 is not None and not df2.empty:
-                        return df2, "stooq", c
-                except Exception as e:
-                    print(f"[WARN] Stooq fallo para {c}: {e}")
+                df2 = self.stooq.fetch_daily(c, outputsize=outputsize)
+                if df2 is not None and not df2.empty:
+                    return df2, "stooq", c
 
-            # 3) Yahoo fallback final (daily)
             for y in (yahoo_candidates or []):
-                try:
-                    df3 = self.yh.fetch_daily(y, outputsize=outputsize)
-                    if df3 is not None and not df3.empty:
-                        return df3, "yahoo", y
-                except Exception as e:
-                    print(f"[WARN] Yahoo fallo para {y}: {e}")
+                df3 = self.yh.fetch_daily(y, outputsize=outputsize)
+                if df3 is not None and not df3.empty:
+                    return df3, "yahoo", y
 
         return pd.DataFrame(), "none", ""
