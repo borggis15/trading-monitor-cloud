@@ -12,11 +12,10 @@ from core.risk import size_from_atr, ev_bps
 from core.model_store import load_latest_models
 
 
-# Umbrales de robustez (ajustables)
 ROBUST_MIN_NTEST = 60
 ROBUST_MIN_SHARPE = 1.0
 ROBUST_MIN_HITRATE = 0.52
-ROBUST_MAX_DD_FLOOR = -0.35  # no permitir BUY si el drawdown fue peor que -35%
+ROBUST_MAX_DD_FLOOR = -0.35
 
 
 def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
@@ -54,13 +53,13 @@ def read_latest_metrics(engine, exchange: str, symbol: str):
     )
     if row.empty:
         return None
-    r = row.iloc[0].to_dict()
-    return r
+    return row.iloc[0].to_dict()
 
 
 def upsert_features(engine, exchange: str, symbol: str, feat: pd.DataFrame):
     if feat is None or feat.empty:
         return 0
+
     f = feat.copy().reset_index()
     f["ts"] = pd.to_datetime(f["ts"], utc=True)
     f["exchange"] = exchange
@@ -129,15 +128,28 @@ def upsert_signal(engine, row: dict):
 
 
 def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
-    candidates = [("XETR", inst["xetra_symbol"])]
+    candidates = []
+
+    # XETR
+    candidates.append(("XETR", inst["xetra_symbol"]))
+
+    # STOOQ candidates
     for c in inst.get("stooq_candidates", []) or []:
         candidates.append(("STOOQ", c))
+
+    # YAHOO candidates (nuevo)
+    for y in inst.get("yahoo_candidates", []) or []:
+        candidates.append(("YAHOO", y))
+
+    # PRIMARY fallback
     candidates.append(("PRIMARY", inst["primary_symbol"]))
 
     for ex, sym in candidates:
         bars = read_bars(engine, ex, sym)
         if bars is not None and not bars.empty:
+            print(f"[SERIES] {inst['name']} usando {ex}:{sym} bars={len(bars)}")
             return ex, sym
+
     return None, None
 
 
@@ -174,6 +186,7 @@ def main():
     engine = get_engine()
 
     processed = 0
+    horizon_days = int(cfg["ml"]["horizon_bars"])
 
     for inst in cfg["universe"]:
         name = inst["name"]
@@ -186,7 +199,12 @@ def main():
             continue
 
         bars = read_bars(engine, ex, sym)
-        feat = compute_features(bars, horizon_bars=int(cfg["ml"]["horizon_bars"]))
+
+        # ✅ Optimización: para features no necesitamos todo, solo ventana reciente
+        # 400 daily ya es poco, pero dejamos margen por si mañana subes outputsize
+        bars = bars.tail(800)
+
+        feat = compute_features(bars, horizon_bars=horizon_days)
         if feat is None or feat.empty:
             print(f"[SCORE SKIP] {name}: features vacío")
             continue
@@ -211,7 +229,6 @@ def main():
             float(cfg["backtest"]["slippage_bps"]),
         )
 
-        # Señal base
         action = "HOLD"
         if proba is not None and ret_exp is not None and ev is not None:
             if proba > 0.60 and ev > 2.0:
@@ -219,7 +236,6 @@ def main():
             elif proba < 0.45 and ev < -2.0:
                 action = "SELL"
 
-        # Filtro robustez SOLO para BUY (long-only conservador)
         m = read_latest_metrics(engine, ex, sym)
         ok_buy, ok_reason = robust_ok_for_buy(m)
         if action == "BUY" and not ok_buy:
@@ -268,7 +284,7 @@ def main():
             "size_eur": size_eur,
             "sl_price": sl,
             "tp_price": tp,
-            "horizon": f"{int(cfg['ml']['horizon_bars'])}d",
+            "horizon": f"{horizon_days}d",
             "explanation": " | ".join(expl),
             "model_id": model_id,
             "asset_id": asset_id,
