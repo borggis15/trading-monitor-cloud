@@ -24,8 +24,7 @@ universe:
     isin: CA5503721063
     xetra_symbol: GXD
     primary_symbol: LUN
-    primary_exchange: "XTSE"   # (aunque en Twelve Data free está en Grow)
-    # Stooq candidates (probamos varias convenciones)
+    primary_exchange: "XTSE"
     stooq_candidates: ["lun.ca", "lun.to", "lun"]
 
   - name: GE Vernova
@@ -59,7 +58,7 @@ signals:
 
 ml:
   enabled: true
-  horizon_bars: 5
+  horizon_bars: 10
   model_type: hgb
   min_train_rows: 200
 
