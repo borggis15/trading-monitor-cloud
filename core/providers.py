@@ -77,6 +77,7 @@ class StooqProvider:
             return pd.DataFrame()
 
         from io import StringIO
+
         df = pd.read_csv(StringIO(txt))
         if df is None or df.empty or "Date" not in df.columns:
             return pd.DataFrame()
@@ -110,14 +111,34 @@ class StooqProvider:
 class YahooProvider:
     def fetch_daily(self, ticker: str, outputsize: int = 400) -> pd.DataFrame:
         try:
-            df = yf.download(ticker, period="5y", interval="1d", auto_adjust=False, progress=False)
+            df = yf.download(
+                ticker,
+                period="5y",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                group_by="column",
+            )
         except Exception:
             return pd.DataFrame()
 
         if df is None or df.empty:
             return pd.DataFrame()
 
-        df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        # ✅ FIX: aplanar MultiIndex (p.ej. ('Open','LUN.TO')) -> 'Open'
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+
+        df = df.rename(
+            columns={
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume",
+            }
+        )
+
         df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
         df = df[~df.index.isna()].sort_index()
 
@@ -127,6 +148,8 @@ class YahooProvider:
         for c in ["open", "high", "low", "close", "volume"]:
             if c not in df.columns:
                 df[c] = pd.NA
+            else:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
 
         return df[["open", "high", "low", "close", "volume"]]
 
