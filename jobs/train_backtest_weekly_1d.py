@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
@@ -34,61 +35,96 @@ def read_bars_1d(engine, exchange: str, symbol: str) -> pd.DataFrame:
     return df.set_index("ts").sort_index()
 
 
-def load_assets_from_bars(engine) -> list[dict]:
-    # Train on whatever exists in bars_1d; this avoids mismatches.
-    df = pd.read_sql(
-        text(
-            """
-            select distinct exchange, symbol, asset_id, asset_name
-            from public.bars_1d
-            """
-        ),
-        engine,
-    )
-    return df.to_dict(orient="records")
+def resolve_series_1d(engine, inst: dict) -> tuple[str | None, str | None]:
+    """
+    DAILY: preferimos STOOQ (gratis) y si hay más fuentes en el futuro,
+    las añadimos aquí.
+    """
+    candidates: list[tuple[str, str]] = []
+
+    for c in inst.get("stooq_candidates", []) or []:
+        candidates.append(("STOOQ", c))
+
+    # opcional: yahoo daily si lo quieres mantener como fallback
+    for y in inst.get("yahoo_candidates", []) or []:
+        candidates.append(("YAHOO", y))
+
+    for ex, sym in candidates:
+        bars = read_bars_1d(engine, ex, sym)
+        if bars is not None and not bars.empty:
+            print(f"[SERIES] {inst['name']} using {ex}:{sym} bars={len(bars)}")
+            return ex, sym
+
+    return None, None
 
 
 def save_models_1d(engine, exchange: str, symbol: str, model_id: str, clf, reg, meta: dict):
+    """
+    Guarda modelos en public.model_store_1d
+    FIX: meta debe pasarse como %(meta)s (no :meta) y conviene json.dumps + cast ::jsonb.
+    """
     import pickle
-    clf_blob = pickle.dumps(clf)
-    reg_blob = pickle.dumps(reg)
+
+    clf_pickle = pickle.dumps(clf)
+    reg_pickle = pickle.dumps(reg)
+    meta_json = json.dumps(meta, ensure_ascii=False)
 
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                insert into public.model_store_1d(exchange,symbol,model_id,trained_at,clf_pickle,reg_pickle,meta)
-                values (:exchange,:symbol,:model_id,now(),:clf_pickle,:reg_pickle,:meta::jsonb)
+                insert into public.model_store_1d(
+                    exchange, symbol, model_id, trained_at,
+                    clf_pickle, reg_pickle, meta
+                )
+                values (
+                    :exchange, :symbol, :model_id, now(),
+                    :clf_pickle, :reg_pickle, (:meta)::jsonb
+                )
                 """
             ),
             {
                 "exchange": exchange,
                 "symbol": symbol,
                 "model_id": model_id,
-                "clf_pickle": clf_blob,
-                "reg_pickle": reg_blob,
-                "meta": meta,
+                "clf_pickle": clf_pickle,
+                "reg_pickle": reg_pickle,
+                "meta": meta_json,
             },
         )
 
 
-def compute_walk_forward_metrics(
+def compute_walk_forward_metrics_1d(
     feat: pd.DataFrame,
     min_train: int,
     fee_bps: float,
     slippage_bps: float,
-    max_oos_points: int = 260,   # ~1 year daily
-    retrain_every: int = 10,
-    rolling_train_window: int = 3000,
+    max_oos_points: int = 252,  # ~ 1 año bursátil
 ):
     df = feat.copy()
     need = FEATURES + ["ret_fwd"]
     if df is None or df.empty or any(c not in df.columns for c in need):
-        return {"n_test": 0, "hit_rate": None, "avg_ret": None, "sharpe": None, "max_dd": None, "profit_factor": None, "notes": "missing_columns"}
+        return {
+            "n_test": 0,
+            "hit_rate": None,
+            "avg_ret": None,
+            "sharpe": None,
+            "max_dd": None,
+            "profit_factor": None,
+            "notes": "Faltan columnas o feat vacío",
+        }
 
     df = df.dropna(subset=need).copy()
-    if len(df) < (min_train + 100):
-        return {"n_test": 0, "hit_rate": None, "avg_ret": None, "sharpe": None, "max_dd": None, "profit_factor": None, "notes": f"too_few_rows={len(df)}"}
+    if len(df) < (min_train + 30):
+        return {
+            "n_test": 0,
+            "hit_rate": None,
+            "avg_ret": None,
+            "sharpe": None,
+            "max_dd": None,
+            "profit_factor": None,
+            "notes": f"Insuficientes filas tras dropna: {len(df)}",
+        }
 
     start = min_train
     end = len(df) - 1
@@ -99,54 +135,52 @@ def compute_walk_forward_metrics(
     hits = 0
     pos_count = 0
     in_pos = False
-    trades = 0
 
-    clf = reg = None
-
-    for step_i, i in enumerate(range(start, end)):
-        train_end = i
-        train_start = max(0, train_end - rolling_train_window)
-        train = df.iloc[train_start:train_end].copy()
-        test = df.iloc[i:i+1].copy()
-
+    for i in range(start, end):
+        train = df.iloc[:i].copy()
+        test = df.iloc[i : i + 1].copy()
         if len(train) < min_train or test.empty:
             continue
 
-        if clf is None or reg is None or (step_i % retrain_every == 0):
-            clf, reg, _ = train_models(train, model_type="hgb", min_rows=min_train)
-
+        clf, reg, _ = train_models(train, model_type="hgb", min_rows=min_train)
         proba, ret_exp = predict(clf, reg, test)
 
         atr = float(test["atr"].iloc[0]) if np.isfinite(test["atr"].iloc[0]) else None
         risk_est = 0.02 if atr else None
+
         ev = ev_bps(ret_exp, risk_est, fee_bps, slippage_bps)
 
         signal = "HOLD"
         if proba is not None and ret_exp is not None and ev is not None:
-            if proba >= 0.62 and ev >= 5.0:
+            if proba > 0.60 and ev > 2.0:
                 signal = "BUY"
-            elif proba <= 0.40 and ev <= -5.0:
+            elif proba < 0.45 and ev < -2.0:
                 signal = "SELL"
 
-        prev = in_pos
         if signal == "BUY":
             in_pos = True
         elif signal == "SELL":
             in_pos = False
-        if (not prev) and in_pos:
-            trades += 1
 
         r = float(test["ret_fwd"].iloc[0])
         strat_r = r if in_pos else 0.0
-        realized.append(strat_r)
 
+        realized.append(strat_r)
         if strat_r != 0.0:
             pos_count += 1
             if strat_r > 0:
                 hits += 1
 
-    if len(realized) < 60:
-        return {"n_test": int(len(realized)), "hit_rate": None, "avg_ret": None, "sharpe": None, "max_dd": None, "profit_factor": None, "notes": "too_few_oos"}
+    if len(realized) < 30:
+        return {
+            "n_test": int(len(realized)),
+            "hit_rate": None,
+            "avg_ret": None,
+            "sharpe": None,
+            "max_dd": None,
+            "profit_factor": None,
+            "notes": f"Pocas muestras OOS: {len(realized)}",
+        }
 
     rets = np.array(realized, dtype=float)
     avg = float(np.mean(rets))
@@ -164,8 +198,15 @@ def compute_walk_forward_metrics(
 
     hit_rate = float(hits / pos_count) if pos_count > 0 else None
 
-    notes = "" if trades > 0 else "no_trades"
-    return {"n_test": int(len(rets)), "hit_rate": hit_rate, "avg_ret": avg, "sharpe": sharpe, "max_dd": max_dd, "profit_factor": pf, "notes": notes}
+    return {
+        "n_test": int(len(rets)),
+        "hit_rate": hit_rate,
+        "avg_ret": avg,
+        "sharpe": sharpe,
+        "max_dd": max_dd,
+        "profit_factor": pf,
+        "notes": "",
+    }
 
 
 def insert_metrics_1d(engine, exchange: str, symbol: str, model_id: str, trained_at: datetime, horizon: str, m: dict):
@@ -204,46 +245,58 @@ def main():
     cfg = load_config()
     engine = get_engine()
 
-    horizon_days = int(cfg["ml"]["horizon_bars"])     # en daily, esto son días
-    min_rows = max(200, int(cfg["ml"]["min_train_rows"]))  # mínimo sensato en daily
-    model_type = cfg["ml"]["model_type"]
+    horizon = int(cfg["ml"]["horizon_bars"])           # ej: 10
+    min_rows = int(cfg["ml"]["min_train_rows"])        # ej: 200
+    model_type = cfg["ml"]["model_type"]               # hgb
 
     fee_bps = float(cfg["backtest"]["fee_bps"])
     slippage_bps = float(cfg["backtest"]["slippage_bps"])
 
     inserted = 0
-    assets = load_assets_from_bars(engine)
 
-    for a in assets:
-        ex = a["exchange"]
-        sym = a["symbol"]
-        name = a.get("asset_name") or f"{ex}:{sym}"
-
-        bars = read_bars_1d(engine, ex, sym)
-        if bars is None or bars.empty or len(bars) < min_rows + horizon_days + 50:
-            print(f"[TRAIN_1D SKIP] {name}: not enough bars ({0 if bars is None else len(bars)})")
+    for inst in cfg["universe"]:
+        name = inst["name"]
+        ex, sym = resolve_series_1d(engine, inst)
+        if not ex or not sym:
+            print(f"[TRAIN SKIP] {name}: sin datos daily")
             continue
 
-        feat = compute_features(bars, horizon_bars=horizon_days)
+        bars = read_bars_1d(engine, ex, sym)
+
+        feat = compute_features(bars, horizon_bars=horizon)
         if feat is None or feat.empty:
-            print(f"[TRAIN_1D SKIP] {name}: empty features")
+            print(f"[TRAIN SKIP] {name}: features vacío")
             continue
 
         clf, reg, train_rows = train_models(feat, model_type=model_type, min_rows=min_rows)
-        model_id = f"{model_type}_{horizon_days}d_1d"
-        meta = {"name": name, "train_rows": int(train_rows), "horizon_days": int(horizon_days), "timeframe": "1d"}
+
+        model_id = f"{model_type}_{horizon}d_1d"
+        meta = {"name": name, "train_rows": int(train_rows), "horizon_days": int(horizon), "timeframe": "1d"}
 
         save_models_1d(engine, ex, sym, model_id, clf, reg, meta)
 
         trained_at = datetime.now(timezone.utc)
-        m = compute_walk_forward_metrics(feat, min_train=min_rows, fee_bps=fee_bps, slippage_bps=slippage_bps)
 
-        insert_metrics_1d(engine, ex, sym, model_id, trained_at, f"{horizon_days}d", m)
+        m = compute_walk_forward_metrics_1d(
+            feat,
+            min_train=min_rows,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            max_oos_points=252,
+        )
+
+        insert_metrics_1d(engine, ex, sym, model_id, trained_at, f"{horizon}d", m)
         inserted += 1
 
-        print(f"[METRICS_1D OK] {name} {ex}:{sym} n_test={m.get('n_test')} sharpe={m.get('sharpe')} max_dd={m.get('max_dd')} hit_rate={m.get('hit_rate')} notes={m.get('notes')}")
+        print(
+            f"[METRICS OK] {name} {ex}:{sym} n_test={m.get('n_test')} sharpe={m.get('sharpe')} "
+            f"max_dd={m.get('max_dd')} hit_rate={m.get('hit_rate')} notes={m.get('notes')}"
+        )
 
-    print(f"[TRAIN_1D DONE] metrics_inserted={inserted}")
+    with engine.begin() as conn:
+        c = conn.execute(text("select count(*) from public.model_metrics_1d")).scalar()
+
+    print(f"[TRAIN DONE] metrics_inserted={inserted} total_metrics_rows={c}")
 
 
 if __name__ == "__main__":
