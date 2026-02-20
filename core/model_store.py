@@ -1,79 +1,68 @@
+# core/model_store.py
 from __future__ import annotations
 
-import pickle
 import json
+import pickle
+import pandas as pd
 from sqlalchemy import text
 
 
-def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, meta: dict):
-    clf_b = pickle.dumps(clf) if clf is not None else None
-    reg_b = pickle.dumps(reg) if reg is not None else None
+def _table(tf: str) -> str:
+    tf = (tf or "15m").lower()
+    return "public.model_store_1d" if tf in ("1d", "d", "day", "daily") else "public.model_store"
 
-    meta_json = json.dumps(meta) if meta is not None else None
+
+def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, meta: dict, tf: str = "15m"):
+    tbl = _table(tf)
+    meta_json = json.dumps(meta or {}, ensure_ascii=False)
+
+    clf_pickle = pickle.dumps(clf)
+    reg_pickle = pickle.dumps(reg)
 
     with engine.begin() as conn:
         conn.execute(
             text(
-                """
-                insert into public.model_store(
-                    exchange,
-                    symbol,
-                    model_id,
-                    trained_at,
-                    clf_pickle,
-                    reg_pickle,
-                    meta
-                )
-                values (
-                    :exchange,
-                    :symbol,
-                    :model_id,
-                    now(),
-                    :clf_pickle,
-                    :reg_pickle,
-                    CAST(:meta_json AS jsonb)
-                )
+                f"""
+                insert into {tbl}(exchange, symbol, model_id, trained_at, clf_pickle, reg_pickle, meta)
+                values (:exchange, :symbol, :model_id, now(), :clf_pickle, :reg_pickle, :meta::jsonb)
                 """
             ),
             {
                 "exchange": exchange,
                 "symbol": symbol,
                 "model_id": model_id,
-                "clf_pickle": clf_b,
-                "reg_pickle": reg_b,
-                "meta_json": meta_json,
+                "clf_pickle": clf_pickle,
+                "reg_pickle": reg_pickle,
+                "meta": meta_json,
             },
         )
 
 
-def load_latest_models(engine, exchange: str, symbol: str):
-    with engine.begin() as conn:
-        row = conn.execute(
-            text(
-                """
-                select model_id, trained_at, clf_pickle, reg_pickle, meta
-                from public.model_store
-                where exchange=:exchange and symbol=:symbol
-                order by trained_at desc
-                limit 1
-                """
-            ),
-            {"exchange": exchange, "symbol": symbol},
-        ).fetchone()
+def load_latest_models(engine, exchange: str, symbol: str, tf: str = "15m"):
+    tbl = _table(tf)
 
-    if not row:
+    df = pd.read_sql(
+        text(
+            f"""
+            select model_id, trained_at, clf_pickle, reg_pickle, meta
+            from {tbl}
+            where exchange=:exchange and symbol=:symbol
+            order by trained_at desc
+            limit 1
+            """
+        ),
+        engine,
+        params={"exchange": exchange, "symbol": symbol},
+    )
+
+    if df.empty:
         return None, None, None
 
-    clf = pickle.loads(row.clf_pickle) if row.clf_pickle is not None else None
-    reg = pickle.loads(row.reg_pickle) if row.reg_pickle is not None else None
+    row = df.iloc[0]
+    clf = pickle.loads(row["clf_pickle"])
+    reg = pickle.loads(row["reg_pickle"])
+    meta = row["meta"] if isinstance(row["meta"], dict) else (json.loads(row["meta"]) if row["meta"] else {})
+    meta["model_id"] = row["model_id"]
+    meta["trained_at"] = row["trained_at"]
 
-    meta = row.meta
-    # dependiendo del driver puede venir dict ya
-    if isinstance(meta, str):
-        meta = json.loads(meta)
-
-    return clf, reg, {
-        "model_id": row.model_id,
-        "trained_at": str(row.trained_at),
-        "meta": meta,
-    }
+    return clf, reg, meta
