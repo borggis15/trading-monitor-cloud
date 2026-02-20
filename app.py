@@ -141,13 +141,33 @@ def load_signals_current(tf: str):
 def load_latest_metrics(tf: str):
     t = tables(tf)
     if tf.lower() == "1d":
-        q = f"""
+    # 1) intentamos la vista 1d
+    q1 = f"""
+    select
+      exchange, symbol, metrics_model_id, trained_at,
+      sharpe, max_dd, hit_rate, profit_factor, n_test, notes
+    from {t["metrics_latest_view"]}
+    """
+    df = pd.read_sql(text(q1), engine)
+
+    # 2) si está vacía, fallback a latest general
+    if df.empty:
+        q2 = """
+        with ranked as (
+          select *,
+            row_number() over (partition by exchange, symbol order by trained_at desc) as rn
+          from public.model_metrics
+        )
         select
-          exchange, symbol, metrics_model_id, trained_at,
+          exchange, symbol,
+          model_id as metrics_model_id,
+          trained_at,
           sharpe, max_dd, hit_rate, profit_factor, n_test, notes
-        from {t["metrics_latest_view"]}
+        from ranked
+        where rn=1
         """
-    else:
+        df = pd.read_sql(text(q2), engine)
+else:
         q = """
         with ranked as (
           select *,
