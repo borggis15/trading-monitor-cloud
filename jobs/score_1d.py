@@ -12,9 +12,11 @@ from core.risk import size_from_atr, ev_bps
 from core.model_store import load_latest_models
 
 # --- Performance / robustness knobs ---
-# Para scoring diario: ventana suficiente para indicadores + estabilidad, pero rápida.
-SCORE_MAX_BARS = 700          # ~2.7 años de diario si fuese 252/año (sobrado)
-FEATURES_UPSERT_ROWS = 5      # guardamos solo las últimas N filas (no miles)
+SCORE_MAX_BARS = 700
+FEATURES_UPSERT_ROWS = 5
+
+# Riesgo fallback (si no podemos estimar ATR/price)
+RISK_FALLBACK = 0.02  # 2%
 
 ROBUST_MIN_NTEST = 60
 ROBUST_MIN_SHARPE = 1.0
@@ -61,23 +63,17 @@ def read_latest_metrics(engine, exchange: str, symbol: str):
 
 
 def upsert_features(engine, exchange: str, symbol: str, feat: pd.DataFrame) -> int:
-    """
-    Guardamos SOLO últimas filas (features recientes) para depurar/monitorizar.
-    No tiene sentido reinsertar miles de filas en cada score.
-    """
     if feat is None or feat.empty:
         return 0
 
     f = feat.copy().reset_index()
     if "ts" not in f.columns:
-        # por seguridad si el índice no se llama ts
         f = f.rename(columns={"index": "ts"})
 
     f["ts"] = pd.to_datetime(f["ts"], utc=True)
     f["exchange"] = exchange
     f["symbol"] = symbol
 
-    # Nos quedamos con las últimas N filas
     f = f.sort_values("ts").tail(FEATURES_UPSERT_ROWS)
 
     cols = ["exchange", "symbol", "ts", "rsi", "ema_fast", "ema_slow", "atr", "zscore", "ret_fwd"]
@@ -144,19 +140,11 @@ def upsert_signal(engine, row: dict):
 
 def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
     candidates = []
-
-    # XETR primero
     candidates.append(("XETR", inst.get("xetra_symbol")))
-
-    # STOOQ
     for c in inst.get("stooq_candidates", []) or []:
         candidates.append(("STOOQ", c))
-
-    # YAHOO
     for y in inst.get("yahoo_candidates", []) or []:
         candidates.append(("YAHOO", y))
-
-    # PRIMARY último
     candidates.append(("PRIMARY", inst.get("primary_symbol")))
 
     for ex, sym in candidates:
@@ -220,7 +208,6 @@ def main():
             print(f"[SCORE SKIP] {name}: no daily bars in DB")
             continue
 
-        # ✅ performance: usamos solo ventana reciente para features / scoring
         bars = bars.tail(SCORE_MAX_BARS)
 
         feat = compute_features(bars, horizon_bars=horizon_days)
@@ -228,7 +215,6 @@ def main():
             print(f"[SCORE SKIP] {name}: features empty")
             continue
 
-        # Guardamos solo últimas features (monitorización)
         upsert_features(engine, ex, sym, feat)
 
         clf, reg, meta = load_latest_models(engine, ex, sym)
@@ -237,10 +223,17 @@ def main():
         last = feat.dropna().tail(1)
         risk_est = None
         if not last.empty and "atr" in last.columns:
-            atr = float(last["atr"].iloc[0])
-            price = float(bars["close"].iloc[-1])
-            if price > 0:
-                risk_est = atr / price
+            try:
+                atr = float(last["atr"].iloc[0])
+                price = float(bars["close"].iloc[-1])
+                if price > 0 and pd.notna(atr):
+                    risk_est = atr / price
+            except Exception:
+                risk_est = None
+
+        # ✅ fallback para no dejar EV en null
+        if risk_est is None:
+            risk_est = RISK_FALLBACK
 
         ev = ev_bps(
             ret_exp,
@@ -263,17 +256,21 @@ def main():
 
         size_eur = sl = tp = None
         if action == "BUY" and not last.empty and "atr" in last.columns:
-            atr = float(last["atr"].iloc[0])
-            price = float(bars["close"].iloc[-1])
-            size_eur, sl = size_from_atr(
-                capital_eur=float(cfg["signals"]["capital_eur"]),
-                risk_pct=float(cfg["signals"]["risk_per_trade_pct"]),
-                max_pos_pct=float(cfg["signals"]["max_position_pct"]),
-                price=price,
-                atr=atr,
-                sl_atr_mult=float(cfg["signals"]["sl_atr_mult"]),
-            )
-            tp = float(price + float(cfg["signals"]["tp_atr_mult"]) * atr)
+            try:
+                atr = float(last["atr"].iloc[0])
+                price = float(bars["close"].iloc[-1])
+                if pd.notna(atr) and price > 0:
+                    size_eur, sl = size_from_atr(
+                        capital_eur=float(cfg["signals"]["capital_eur"]),
+                        risk_pct=float(cfg["signals"]["risk_per_trade_pct"]),
+                        max_pos_pct=float(cfg["signals"]["max_position_pct"]),
+                        price=price,
+                        atr=atr,
+                        sl_atr_mult=float(cfg["signals"]["sl_atr_mult"]),
+                    )
+                    tp = float(price + float(cfg["signals"]["tp_atr_mult"]) * atr)
+            except Exception:
+                size_eur = sl = tp = None
 
         ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
         model_id = meta["model_id"] if meta else "no_model"
@@ -284,6 +281,7 @@ def main():
             f"model={model_id}",
             f"proba={None if proba is None else round(float(proba),3)}",
             f"ret_exp={None if ret_exp is None else round(float(ret_exp),4)}",
+            f"risk={round(float(risk_est),4)}",
             f"ev_bps={None if ev is None else round(float(ev),2)}",
             f"gate={ok_reason}",
         ]
