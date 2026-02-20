@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import ProgrammingError, OperationalError
 
 st.set_page_config(page_title="Trading Monitor Pro", layout="wide")
 
@@ -41,10 +42,10 @@ def bps_to_pct_str(ev_bps, empty="—"):
 def action_style(action: str):
     a = (action or "").upper()
     if a == "BUY":
-        return ("BUY", "#0f766e")
+        return ("BUY", "#0f766e")   # teal
     if a == "SELL":
-        return ("SELL", "#b42318")
-    return ("HOLD", "#1f2937")
+        return ("SELL", "#b42318")  # red
+    return ("HOLD", "#1f2937")      # slate
 
 def trend_from_ret(ret_exp):
     v = num(ret_exp)
@@ -57,6 +58,9 @@ def trend_from_ret(ret_exp):
     return "Neutral"
 
 def confidence_score(proba_up, sharpe, n_test):
+    """
+    Score orientativo 0-100 para UI.
+    """
     p = num(proba_up)
     sh = num(sharpe)
     nt = num(n_test)
@@ -64,27 +68,30 @@ def confidence_score(proba_up, sharpe, n_test):
     if p is None:
         return None
 
-    base = max(0.0, min(1.0, p)) * 70.0
+    base = max(0.0, min(1.0, p)) * 70.0  # 0..70
     sh_bonus = 0.0
     if sh is not None:
-        sh_bonus = max(0.0, min(1.0, sh / 10.0)) * 20.0
+        sh_bonus = max(0.0, min(1.0, sh / 10.0)) * 20.0  # 0..20
     nt_bonus = 0.0
     if nt is not None:
-        nt_bonus = max(0.0, min(1.0, nt / 300.0)) * 10.0
+        nt_bonus = max(0.0, min(1.0, nt / 250.0)) * 10.0  # 0..10
 
     return round(min(100.0, base + sh_bonus + nt_bonus), 0)
 
-def horizon_days_from_row(row):
+def horizon_days_from_row(row, default_h=10):
     h = row.get("horizon", None)
+    if h is None:
+        return default_h
+    # si viene como "10d"
     if isinstance(h, str) and h.endswith("d"):
         try:
-            return int(h[:-1])
+            return int(h.replace("d", ""))
         except Exception:
-            return 10
+            return default_h
     hv = num(h)
     if hv is not None and hv > 0:
         return int(hv)
-    return 10
+    return default_h
 
 def expected_pnl_eur(size_eur, ret_exp):
     s = num(size_eur)
@@ -94,25 +101,25 @@ def expected_pnl_eur(size_eur, ret_exp):
     return s * r
 
 # ----------------------------
-# Dynamic table names by timeframe
+# Timeframe mapping
 # ----------------------------
-def tables(tf: str):
-    tf = tf.lower()
+def tf_tables(tf: str):
+    tf = (tf or "15m").lower()
     if tf == "1d":
         return {
             "signals_current": "public.signals_1d_current_by_asset",
-            "signals_hist": "public.signals_1d",
-            "bars": "public.bars_1d",
+            "signals_table": "public.signals_1d",
+            "bars_table": "public.bars_1d",
+            # si existe en tu DB, la usará; si no existe, hará fallback
             "metrics_latest_view": "public.model_metrics_1d_latest",
-            "title_suffix": "(1D)",
+            "default_horizon_days": 10,
         }
-    # default 15m
     return {
         "signals_current": "public.signals_current_by_asset",
-        "signals_hist": "public.signals",
-        "bars": "public.bars_15m",
-        "metrics_latest_view": None,  # we compute latest in SQL
-        "title_suffix": "(15m)",
+        "signals_table": "public.signals",
+        "bars_table": "public.bars_15m",
+        "metrics_latest_view": "public.model_metrics_latest",
+        "default_horizon_days": 10,
     }
 
 # ----------------------------
@@ -120,13 +127,14 @@ def tables(tf: str):
 # ----------------------------
 @st.cache_data(ttl=60)
 def load_signals_current(tf: str):
-    t = tables(tf)
+    t = tf_tables(tf)
     q = f"""
     select
       asset_name, asset_id,
       exchange, symbol, ts,
       action, ev_bps,
-      proba_up, ret_exp, risk_est,
+      proba_up, ret_exp,
+      risk_est,
       size_eur, sl_price, tp_price,
       horizon, explanation, model_id
     from {t["signals_current"]}
@@ -139,65 +147,68 @@ def load_signals_current(tf: str):
 
 @st.cache_data(ttl=120)
 def load_latest_metrics(tf: str):
-    t = tables(tf)
-    if tf.lower() == "1d":
-        # 1) intentamos la vista 1d
-        q1 = f"""
-        select
-          exchange, symbol, metrics_model_id, trained_at,
-          sharpe, max_dd, hit_rate, profit_factor, n_test, notes
-        from {t["metrics_latest_view"]}
-        """
-        df = pd.read_sql(text(q1), engine)
-    
-        # 2) si está vacía, fallback a latest general
-        if df.empty:
-            q2 = """
-            with ranked as (
-              select *,
-                row_number() over (partition by exchange, symbol order by trained_at desc) as rn
-              from public.model_metrics
-            )
-            select
-              exchange, symbol,
-              model_id as metrics_model_id,
-              trained_at,
-              sharpe, max_dd, hit_rate, profit_factor, n_test, notes
-            from ranked
-            where rn=1
-            """
-            df = pd.read_sql(text(q2), engine)
-    else:
-        q = """
-        with ranked as (
-          select *,
-            row_number() over (partition by exchange, symbol order by trained_at desc) as rn
-          from public.model_metrics
-        )
-        select
-          exchange, symbol,
-          model_id as metrics_model_id,
-          trained_at,
-          sharpe, max_dd, hit_rate, profit_factor, n_test, notes
-        from ranked
-        where rn=1
-        """
-    df = pd.read_sql(text(q), engine)
-    if not df.empty:
-        df["trained_at"] = to_dt_utc(df["trained_at"])
-    return df
+    """
+    15m: intenta view model_metrics_latest si existe, si no fallback.
+    1d: intenta view model_metrics_1d_latest si existe, si no fallback.
+    Fallback: coge latest general de public.model_metrics (sin filtrar por model_id).
+    """
+    t = tf_tables(tf)
+
+    # 1) Intento: vista específica (si existe)
+    q_view = f"""
+    select
+      exchange, symbol,
+      metrics_model_id, trained_at,
+      sharpe, max_dd, hit_rate, profit_factor, n_test, notes
+    from {t["metrics_latest_view"]}
+    """
+    try:
+        df = pd.read_sql(text(q_view), engine)
+        if not df.empty:
+            df["trained_at"] = to_dt_utc(df["trained_at"])
+            return df
+    except (ProgrammingError, OperationalError):
+        # vista no existe o no accesible → fallback
+        pass
+    except Exception:
+        # cualquier otro error → fallback
+        pass
+
+    # 2) Fallback: latest general por (exchange, symbol)
+    q_fallback = """
+    with ranked as (
+      select *,
+        row_number() over (partition by exchange, symbol order by trained_at desc) as rn
+      from public.model_metrics
+    )
+    select
+      exchange, symbol,
+      model_id as metrics_model_id,
+      trained_at,
+      sharpe, max_dd, hit_rate, profit_factor, n_test, notes
+    from ranked
+    where rn=1
+    """
+    df2 = pd.read_sql(text(q_fallback), engine)
+    if not df2.empty:
+        df2["trained_at"] = to_dt_utc(df2["trained_at"])
+    return df2
 
 @st.cache_data(ttl=60)
-def load_bars(tf: str, exchange: str, symbol: str, limit: int):
-    t = tables(tf)
+def load_bars(tf: str, exchange: str, symbol: str, limit=900):
+    t = tf_tables(tf)
     q = f"""
     select ts, open, high, low, close, volume
-    from {t["bars"]}
+    from {t["bars_table"]}
     where exchange=:exchange and symbol=:symbol
     order by ts desc
     limit :limit
     """
-    df = pd.read_sql(text(q), engine, params={"exchange": exchange, "symbol": symbol, "limit": int(limit)})
+    df = pd.read_sql(
+        text(q),
+        engine,
+        params={"exchange": exchange, "symbol": symbol, "limit": int(limit)}
+    )
     if df.empty:
         return df
     df["ts"] = to_dt_utc(df["ts"])
@@ -205,31 +216,39 @@ def load_bars(tf: str, exchange: str, symbol: str, limit: int):
     return df
 
 @st.cache_data(ttl=60)
-def load_signal_history(tf: str, exchange: str, symbol: str, limit: int):
-    t = tables(tf)
+def load_signal_history(tf: str, exchange: str, symbol: str, limit=250):
+    t = tf_tables(tf)
     q = f"""
     select ts, action, ev_bps, proba_up, ret_exp, risk_est, size_eur, sl_price, tp_price, model_id
-    from {t["signals_hist"]}
+    from {t["signals_table"]}
     where exchange=:exchange and symbol=:symbol
     order by ts desc
     limit :limit
     """
-    df = pd.read_sql(text(q), engine, params={"exchange": exchange, "symbol": symbol, "limit": int(limit)})
+    df = pd.read_sql(
+        text(q),
+        engine,
+        params={"exchange": exchange, "symbol": symbol, "limit": int(limit)}
+    )
     if df.empty:
         return df
     df["ts"] = to_dt_utc(df["ts"])
     df = df.dropna(subset=["ts"]).sort_values("ts")
     return df
+
+# ----------------------------
+# Header
+# ----------------------------
+st.title("Trading Monitor Pro")
 
 # ----------------------------
 # Sidebar
 # ----------------------------
-st.title("Trading Monitor Pro")
-
 with st.sidebar:
     st.subheader("Controls")
 
-    tf = st.selectbox("Timeframe", options=["15m", "1d"], index=0)
+    # Selector timeframe
+    tf = st.radio("Timeframe", ["15m", "1d"], index=0, horizontal=True)
 
     if st.button("Refresh", use_container_width=True):
         st.cache_data.clear()
@@ -242,14 +261,12 @@ with st.sidebar:
     )
 
     st.subheader("Quality filters")
-    hide_no_metrics = st.checkbox("Hide assets without backtest metrics", value=False)
-
-    min_ev = st.slider("Min EV (bps)", min_value=-1000, max_value=2000, value=-1000, step=10)
-    min_sharpe = st.slider("Min Sharpe", min_value=-2.0, max_value=20.0, value=-2.0, step=0.1)
-    min_n_test = st.slider("Min n_test", min_value=0, max_value=1000, value=0, step=10)
+    min_ev = st.slider("Min EV (bps)", min_value=-1000, max_value=1500, value=-1000, step=10)
+    min_sharpe = st.slider("Min Sharpe", min_value=-2.0, max_value=15.0, value=-2.0, step=0.1)
+    min_n_test = st.slider("Min n_test", min_value=0, max_value=500, value=0, step=10)
 
     st.subheader("Urgency banner")
-    urgent_ev = st.slider("Urgent EV (bps)", min_value=0, max_value=2000, value=900, step=10)
+    urgent_ev = st.slider("Urgent EV (bps)", min_value=0, max_value=1500, value=900, step=10)
     urgent_conf = st.slider("Urgent confidence", min_value=50, max_value=95, value=80, step=1)
 
     st.subheader("Sizing (optional)")
@@ -266,7 +283,7 @@ signals = load_signals_current(tf)
 metrics = load_latest_metrics(tf)
 
 if signals.empty:
-    st.warning(f"No current signals for {tf}. Run the corresponding scoring workflow.")
+    st.warning(f"No current signals for {tf}. Run the corresponding score workflow.")
     st.stop()
 
 df = signals.merge(metrics, on=["exchange", "symbol"], how="left")
@@ -277,18 +294,16 @@ for c in ["ev_bps", "proba_up", "ret_exp", "risk_est", "size_eur", "sl_price", "
     if c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-df["confidence"] = df.apply(lambda r: confidence_score(r.get("proba_up"), r.get("sharpe"), r.get("n_test")), axis=1)
+df["confidence"] = df.apply(
+    lambda r: confidence_score(r.get("proba_up"), r.get("sharpe"), r.get("n_test")),
+    axis=1
+)
 
-# Filters (IMPORTANT: do NOT wipe everything if metrics are missing)
+# Filters
 df_view = df[df["action"].isin(actions_filter)].copy()
 df_view = df_view[df_view["ev_bps"].fillna(-1e9) >= float(min_ev)]
-
-if hide_no_metrics:
-    df_view = df_view[df_view["sharpe"].notna() & df_view["n_test"].notna()]
-
-# Only apply sharpe/n_test filters to rows that actually have metrics
-df_view = df_view[(df_view["sharpe"].isna()) | (df_view["sharpe"] >= float(min_sharpe))]
-df_view = df_view[(df_view["n_test"].isna()) | (df_view["n_test"] >= float(min_n_test))]
+df_view = df_view[df_view["sharpe"].fillna(-1e9) >= float(min_sharpe)]
+df_view = df_view[df_view["n_test"].fillna(-1e9) >= float(min_n_test)]
 
 # Sorting
 if sort_by == "EV (bps)":
@@ -300,7 +315,7 @@ elif sort_by == "Sharpe":
 elif sort_by == "Hit rate":
     df_rank = df_view.sort_values("hit_rate", ascending=False)
 elif sort_by == "Max DD":
-    df_rank = df_view.sort_values("max_dd", ascending=True)
+    df_rank = df_view.sort_values("max_dd", ascending=True)  # less negative is better
 elif sort_by == "n_test":
     df_rank = df_view.sort_values("n_test", ascending=False)
 else:
@@ -310,11 +325,9 @@ else:
 # Urgency banner
 # ----------------------------
 urgent = df.copy()
-urgent = urgent[
-    (urgent["action"] == "BUY") &
-    (urgent["ev_bps"].fillna(-1e9) >= urgent_ev) &
-    (urgent["confidence"].fillna(0) >= urgent_conf)
-].copy()
+urgent = urgent[(urgent["action"] == "BUY") &
+                (urgent["ev_bps"].fillna(-1e9) >= urgent_ev) &
+                (urgent["confidence"].fillna(0) >= urgent_conf)].copy()
 
 if not urgent.empty:
     top = urgent.sort_values(["ev_bps", "confidence"], ascending=False).iloc[0]
@@ -337,79 +350,78 @@ st.divider()
 # ----------------------------
 # Cards
 # ----------------------------
-st.subheader(f"Current signals {tables(tf)['title_suffix']}")
+st.subheader(f"Current signals ({tf})")
 
 cols = st.columns(3)
 cards = df_rank.sort_values("asset_name").to_dict(orient="records")
+default_h = tf_tables(tf)["default_horizon_days"]
 
-if not cards:
-    st.warning("No assets match current filters. Try lowering quality filters or unchecking 'Hide assets without metrics'.")
-else:
-    for i, r in enumerate(cards):
-        with cols[i % 3]:
-            with st.container(border=True):
-                name = r.get("asset_name") or "—"
-                ex = r.get("exchange") or "—"
-                sym = r.get("symbol") or "—"
-                action_txt, color = action_style(r.get("action"))
-                h_days = horizon_days_from_row(r)
+for i, r in enumerate(cards):
+    with cols[i % 3]:
+        with st.container(border=True):
+            name = r.get("asset_name") or "—"
+            ex = r.get("exchange") or "—"
+            sym = r.get("symbol") or "—"
+            action_txt, color = action_style(r.get("action"))
+            h_days = horizon_days_from_row(r, default_h=default_h)
+            ts = r.get("ts")
+            entry_ts = ts if pd.notna(ts) else None
+            exit_ts = (entry_ts + pd.Timedelta(days=h_days)) if entry_ts is not None else None
 
-                ts = r.get("ts")
-                entry_ts = ts if pd.notna(ts) else None
-                exit_ts = (entry_ts + pd.Timedelta(days=h_days)) if entry_ts is not None else None
+            size_eur = num(r.get("size_eur"))
+            if size_eur is None and default_size > 0:
+                size_eur = float(default_size)
 
-                size_eur = num(r.get("size_eur"))
-                if size_eur is None and default_size > 0:
-                    size_eur = float(default_size)
+            pnl_eur = expected_pnl_eur(size_eur, r.get("ret_exp"))
 
-                pnl_eur = expected_pnl_eur(size_eur, r.get("ret_exp"))
+            st.markdown(f"**{name}**")
+            st.caption(f"{ex}:{sym} · model {r.get('model_id','—')} · horizon {h_days}d")
 
-                st.markdown(f"**{name}**")
-                st.caption(f"{ex}:{sym} · model {r.get('model_id','—')} · horizon {h_days}d")
+            c1, c2, c3 = st.columns([1.0, 1.1, 1.1])
+            with c1:
+                st.markdown(
+                    f"<div style='display:inline-block;padding:6px 10px;border-radius:999px;background:{color};color:white;font-weight:700;'>"
+                    f"{action_txt}</div>",
+                    unsafe_allow_html=True
+                )
+            with c2:
+                st.metric("EV (bps)", fmt(r.get("ev_bps"), 1))
+            with c3:
+                conf = r.get("confidence")
+                st.metric("Confidence", f"{int(conf)}/100" if pd.notna(conf) else "—")
 
-                c1, c2, c3 = st.columns([1.0, 1.1, 1.1])
-                with c1:
-                    st.markdown(
-                        f"<div style='display:inline-block;padding:6px 10px;border-radius:999px;background:{color};color:white;font-weight:700;'>"
-                        f"{action_txt}</div>",
-                        unsafe_allow_html=True
-                    )
-                with c2:
-                    st.metric("EV (bps)", fmt(r.get("ev_bps"), 1))
-                with c3:
-                    conf = r.get("confidence")
-                    st.metric("Confidence", f"{int(conf)}/100" if pd.notna(conf) else "—")
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                st.metric("Exp. return", fmt_pct(r.get("ret_exp"), 2))
+            with c5:
+                st.metric("Risk est.", fmt(r.get("risk_est"), 4))
+            with c6:
+                st.metric("Exp. P&L (€)", fmt(pnl_eur, 0))
 
-                c4, c5, c6 = st.columns(3)
-                with c4:
-                    st.metric("Exp. return", fmt_pct(r.get("ret_exp"), 2))
-                with c5:
-                    st.metric("Suggested size (€)", fmt(size_eur, 0))
-                with c6:
-                    st.metric("Exp. P&L (€)", fmt(pnl_eur, 0))
+            if entry_ts is not None:
+                st.caption(
+                    f"Window: entry {entry_ts.strftime('%Y-%m-%d %H:%M')} → target {exit_ts.strftime('%Y-%m-%d %H:%M') if exit_ts is not None else '—'} (UTC)"
+                )
+            else:
+                st.caption("Window: —")
 
-                if entry_ts is not None:
-                    st.caption(
-                        f"Window: entry {entry_ts.strftime('%Y-%m-%d')} → target {exit_ts.strftime('%Y-%m-%d') if exit_ts is not None else '—'} (UTC)"
-                    )
-                else:
-                    st.caption("Window: —")
+            tlabel = trend_from_ret(r.get("ret_exp"))
+            if action_txt == "BUY":
+                st.write(f"Bias: {tlabel}. Enter within the window; exit on SELL or at target date.")
+                if pd.notna(r.get("sl_price")) or pd.notna(r.get("tp_price")):
+                    st.caption(f"Levels: SL {fmt(r.get('sl_price'),2)} · TP {fmt(r.get('tp_price'),2)}")
+            elif action_txt == "SELL":
+                st.write(f"Bias: {tlabel}. Avoid new entries; if holding, reduce/exit on next liquidity window.")
+            else:
+                st.write(f"Bias: {tlabel}. Wait; reassess on next update.")
 
-                tlabel = trend_from_ret(r.get("ret_exp"))
-                if action_txt == "BUY":
-                    st.write(f"Trend: {tlabel}. Plan: enter within the window; exit on SELL signal or at target date.")
-                elif action_txt == "SELL":
-                    st.write(f"Trend: {tlabel}. Plan: avoid new entries; if holding, reduce/exit on next liquidity window.")
-                else:
-                    st.write(f"Trend: {tlabel}. Plan: wait; reassess on next update.")
-
-                with st.expander("Technical details"):
-                    st.code((r.get("explanation") or "").strip(), language="text")
+            with st.expander("Technical details"):
+                st.code((r.get("explanation") or "").strip(), language="text")
 
 st.divider()
 
 # ----------------------------
-# Ranking table
+# Ranking
 # ----------------------------
 st.subheader("Ranking")
 
@@ -419,12 +431,7 @@ show_cols = [
     "sharpe", "max_dd", "hit_rate", "n_test",
     "model_id"
 ]
-df_show = df_rank.copy()
-for col in ["ev_bps", "proba_up", "ret_exp", "risk_est", "sharpe", "max_dd", "hit_rate", "confidence"]:
-    if col in df_show.columns:
-        df_show[col] = df_show[col].round(4)
-
-st.dataframe(df_show[show_cols], use_container_width=True, hide_index=True)
+st.dataframe(df_rank[show_cols], use_container_width=True)
 
 st.divider()
 
@@ -434,19 +441,18 @@ st.divider()
 st.subheader("Asset detail")
 
 names = df_rank["asset_name"].tolist() if not df_rank.empty else df["asset_name"].tolist()
-sel = st.selectbox("Select an asset", options=names, index=0)
+if not names:
+    st.info("No assets under current filters.")
+    st.stop()
 
+sel = st.selectbox("Select an asset", options=names, index=0)
 row = df[df["asset_name"] == sel].iloc[0]
 ex = row["exchange"]
 sym = row["symbol"]
-h_days = horizon_days_from_row(row)
+h_days = horizon_days_from_row(row, default_h=default_h)
 
-# limits by tf
-bars_limit = 900 if tf == "15m" else 3000
-hist_limit = 250 if tf == "15m" else 600
-
-bars = load_bars(tf, ex, sym, limit=bars_limit)
-hist = load_signal_history(tf, ex, sym, limit=hist_limit)
+bars = load_bars(tf, ex, sym, limit=900)
+hist = load_signal_history(tf, ex, sym, limit=250)
 
 if bars.empty:
     st.warning("No bars available for this asset.")
@@ -488,7 +494,6 @@ with left:
         f"{action_txt}</div>",
         unsafe_allow_html=True
     )
-
     st.write("")
     st.write(f"EV: {fmt(row.get('ev_bps'),1)} bps ({bps_to_pct_str(row.get('ev_bps'))})")
     st.write(f"Expected return: {fmt_pct(row.get('ret_exp'),2)} ({trend_from_ret(row.get('ret_exp'))})")
@@ -501,8 +506,7 @@ with right:
     st.write(f"Max drawdown: {fmt(row.get('max_dd'),2)}")
     st.write(f"Hit rate: {fmt(row.get('hit_rate'),2)}")
     st.write(f"n_test: {int(row.get('n_test')) if pd.notna(row.get('n_test')) else '—'}")
-    trained = row.get("trained_at")
-    st.caption(f"Trained at (UTC): {trained if pd.notna(trained) else '—'}")
+    st.caption(f"Trained at (UTC): {row.get('trained_at','—')}")
 
 with st.expander("Technical details"):
     st.code((row.get("explanation") or "").strip(), language="text")
