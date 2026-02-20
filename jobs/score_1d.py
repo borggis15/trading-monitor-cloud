@@ -1,9 +1,8 @@
-# jobs/score_1d.py
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import pandas as pd
 from sqlalchemy import text
+from datetime import datetime, timezone
 
 from core.config import load_config
 from core.db import get_engine
@@ -13,21 +12,16 @@ from core.risk import size_from_atr, ev_bps
 from core.model_store import load_latest_models
 
 
-# Robust gates (puedes ajustar luego, pero esto es “conservador-profesional”)
-ROBUST_MIN_NTEST = 120
+# --- Robust gates (ajusta si quieres) ---
+ROBUST_MIN_NTEST = 80
 ROBUST_MIN_SHARPE = 1.0
 ROBUST_MIN_HITRATE = 0.52
-ROBUST_MAX_DD_FLOOR = -0.35
 
-
-def _cfg_block(cfg: dict, key: str, fallback_key: str = "ml") -> dict:
-    """
-    Permite tener secciones específicas para 1d:
-      - ml_1d, signals_1d, backtest_1d
-    y si no existen, usa las generales:
-      - ml, signals, backtest
-    """
-    return cfg.get(key) or cfg.get(fallback_key) or {}
+# Gate por drawdown (tiers)
+# hard: bloquea BUY siempre
+# soft: bloquea BUY salvo EV muy alto (lo dejamos bloqueando igual, pero lo reportamos)
+HARD_MAX_DD_FLOOR = -0.65
+SOFT_MAX_DD_FLOOR = -0.35
 
 
 def read_bars_1d(engine, exchange: str, symbol: str) -> pd.DataFrame:
@@ -50,7 +44,7 @@ def read_bars_1d(engine, exchange: str, symbol: str) -> pd.DataFrame:
 
 
 def read_latest_metrics_1d(engine, exchange: str, symbol: str):
-    df = pd.read_sql(
+    row = pd.read_sql(
         text(
             """
             select sharpe, max_dd, hit_rate, profit_factor, n_test, trained_at, model_id
@@ -63,9 +57,9 @@ def read_latest_metrics_1d(engine, exchange: str, symbol: str):
         engine,
         params={"exchange": exchange, "symbol": symbol},
     )
-    if df.empty:
+    if row.empty:
         return None
-    return df.iloc[0].to_dict()
+    return row.iloc[0].to_dict()
 
 
 def upsert_signal_1d(engine, row: dict):
@@ -74,18 +68,18 @@ def upsert_signal_1d(engine, row: dict):
             text(
                 """
                 insert into public.signals_1d(
-                  exchange, symbol, ts,
-                  action, proba_up, ret_exp, risk_est, ev_bps,
-                  size_eur, sl_price, tp_price, horizon, explanation, model_id,
+                  exchange,symbol,ts,
+                  action,proba_up,ret_exp,risk_est,ev_bps,
+                  size_eur,sl_price,tp_price,horizon,explanation,model_id,
                   asset_id, asset_name
                 )
                 values (
-                  :exchange, :symbol, :ts,
-                  :action, :proba_up, :ret_exp, :risk_est, :ev_bps,
-                  :size_eur, :sl_price, :tp_price, :horizon, :explanation, :model_id,
+                  :exchange,:symbol,:ts,
+                  :action,:proba_up,:ret_exp,:risk_est,:ev_bps,
+                  :size_eur,:sl_price,:tp_price,:horizon,:explanation,:model_id,
                   :asset_id, :asset_name
                 )
-                on conflict (exchange, symbol, ts) do update set
+                on conflict (exchange,symbol,ts) do update set
                   action=excluded.action,
                   proba_up=excluded.proba_up,
                   ret_exp=excluded.ret_exp,
@@ -106,23 +100,25 @@ def upsert_signal_1d(engine, row: dict):
 
 
 def resolve_series_1d(engine, inst: dict) -> tuple[str | None, str | None]:
-    candidates = []
+    candidates: list[tuple[str, str]] = []
 
-    # STOOQ primero en 1d (porque te está funcionando bien)
+    # Prefer STOOQ daily
     for c in inst.get("stooq_candidates", []) or []:
         candidates.append(("STOOQ", c))
 
-    # YAHOO como alternativa
+    # Yahoo daily fallback (si lo tienes)
     for y in inst.get("yahoo_candidates", []) or []:
         candidates.append(("YAHOO", y))
 
-    # XETR al final (en 1d puede que no esté en plan gratis)
-    if inst.get("xetra_symbol"):
-        candidates.append(("XETR", inst["xetra_symbol"]))
+    # XETR daily (si existiera en 1d)
+    x = inst.get("xetra_symbol")
+    if x:
+        candidates.append(("XETR", x))
 
-    # PRIMARY último
-    if inst.get("primary_symbol"):
-        candidates.append(("PRIMARY", inst["primary_symbol"]))
+    # last resort
+    p = inst.get("primary_symbol")
+    if p:
+        candidates.append(("PRIMARY", p))
 
     for ex, sym in candidates:
         bars = read_bars_1d(engine, ex, sym)
@@ -133,46 +129,53 @@ def resolve_series_1d(engine, inst: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
-def robust_ok_for_buy(m: dict | None) -> tuple[bool, str]:
+def robust_gate(m: dict | None) -> tuple[bool, str, str]:
+    """
+    Returns: (ok_for_buy, tier, reason)
+    tier in: none / soft / hard
+    """
     if not m:
-        return False, "no metrics"
+        return False, "hard", "no_metrics"
 
     n_test = m.get("n_test")
     sharpe = m.get("sharpe")
     max_dd = m.get("max_dd")
     hit = m.get("hit_rate")
 
-    ok = True
     reasons = []
 
+    # Base requirements
     if n_test is None or int(n_test) < ROBUST_MIN_NTEST:
-        ok = False
         reasons.append(f"n_test<{ROBUST_MIN_NTEST}")
     if sharpe is None or float(sharpe) < ROBUST_MIN_SHARPE:
-        ok = False
         reasons.append(f"sharpe<{ROBUST_MIN_SHARPE}")
     if hit is None or float(hit) < ROBUST_MIN_HITRATE:
-        ok = False
         reasons.append(f"hit_rate<{ROBUST_MIN_HITRATE}")
-    if max_dd is None or float(max_dd) < ROBUST_MAX_DD_FLOOR:
-        ok = False
-        reasons.append(f"max_dd<{ROBUST_MAX_DD_FLOOR}")
 
-    return ok, ("ok" if ok else ", ".join(reasons))
+    # DD tiers
+    tier = "none"
+    if max_dd is None:
+        tier = "hard"
+        reasons.append("max_dd_missing")
+    else:
+        dd = float(max_dd)
+        if dd < HARD_MAX_DD_FLOOR:
+            tier = "hard"
+            reasons.append(f"max_dd<{HARD_MAX_DD_FLOOR}")
+        elif dd < SOFT_MAX_DD_FLOOR:
+            tier = "soft"
+            reasons.append(f"max_dd<{SOFT_MAX_DD_FLOOR}")
+
+    ok = (len(reasons) == 0)
+    reason = "ok" if ok else ", ".join(reasons)
+    return ok, tier, reason
 
 
 def main():
     cfg = load_config()
     engine = get_engine()
 
-    ml = _cfg_block(cfg, "ml_1d", "ml")
-    backtest = _cfg_block(cfg, "backtest_1d", "backtest")
-    sig = _cfg_block(cfg, "signals_1d", "signals")
-
-    horizon_days = int(ml.get("horizon_bars", 10))  # en 1d, “bars” == días
-    fee_bps = float(backtest.get("fee_bps", 0.0))
-    slippage_bps = float(backtest.get("slippage_bps", 0.0))
-
+    horizon_days = int(cfg["ml"]["horizon_days_1d"])
     processed = 0
 
     for inst in cfg["universe"]:
@@ -187,85 +190,84 @@ def main():
 
         bars = read_bars_1d(engine, ex, sym)
         if bars is None or bars.empty:
-            print(f"[SCORE SKIP] {name}: empty daily bars")
+            print(f"[SCORE SKIP] {name}: no daily bars in DB")
             continue
 
-        # Para daily sí queremos histórico (pero controlado)
-        # si tienes 2500, lo dejamos tal cual; si mañana crece, limitamos a 4000
-        bars = bars.tail(4000)
+        # features (daily) – keep enough history for indicators
+        bars_feat = bars.tail(3000)
 
-        feat = compute_features(bars, horizon_bars=horizon_days)
+        feat = compute_features(bars_feat, horizon_bars=horizon_days)
         if feat is None or feat.empty:
             print(f"[SCORE SKIP] {name}: features empty")
             continue
 
-        # ✅ Cargar modelos 1d desde model_store_1d
+        # load latest trained models for 1d
         clf, reg, meta = load_latest_models(engine, ex, sym, tf="1d")
-        if clf is None or reg is None:
-            print(f"[SCORE SKIP] {name}: no 1d model in model_store_1d for {ex}:{sym}")
-            continue
-
         proba, ret_exp = predict(clf, reg, feat)
 
+        # risk_est from ATR
         last = feat.dropna().tail(1)
         risk_est = None
         if not last.empty and "atr" in last.columns:
             atr = float(last["atr"].iloc[0])
             price = float(bars["close"].iloc[-1])
-            if price > 0:
+            if price > 0 and atr > 0:
                 risk_est = atr / price
 
         ev = ev_bps(
             ret_exp,
             risk_est,
-            fee_bps,
-            slippage_bps,
+            float(cfg["backtest"]["fee_bps"]),
+            float(cfg["backtest"]["slippage_bps"]),
         )
 
-        # Reglas base (igual que 15m)
-        action = "HOLD"
+        # --- raw action (before robustness gate)
+        pre_action = "HOLD"
         if proba is not None and ret_exp is not None and ev is not None:
             if proba > 0.60 and ev > 2.0:
-                action = "BUY"
+                pre_action = "BUY"
             elif proba < 0.45 and ev < -2.0:
-                action = "SELL"
+                pre_action = "SELL"
 
-        # Robust gate con métricas 1d
+        # --- gate
         m = read_latest_metrics_1d(engine, ex, sym)
-        ok_buy, ok_reason = robust_ok_for_buy(m)
-        if action == "BUY" and not ok_buy:
-            action = "HOLD"
+        ok_buy, tier, reason = robust_gate(m)
 
+        action = pre_action
+        if pre_action == "BUY" and not ok_buy:
+            action = "HOLD"  # BUY blocked
+
+        # sizing only for BUY
         size_eur = sl = tp = None
         if action == "BUY" and not last.empty and "atr" in last.columns:
             atr = float(last["atr"].iloc[0])
             price = float(bars["close"].iloc[-1])
             size_eur, sl = size_from_atr(
-                capital_eur=float(sig.get("capital_eur", 10000)),
-                risk_pct=float(sig.get("risk_per_trade_pct", 1.0)),
-                max_pos_pct=float(sig.get("max_position_pct", 25.0)),
+                capital_eur=float(cfg["signals"]["capital_eur"]),
+                risk_pct=float(cfg["signals"]["risk_per_trade_pct"]),
+                max_pos_pct=float(cfg["signals"]["max_position_pct"]),
                 price=price,
                 atr=atr,
-                sl_atr_mult=float(sig.get("sl_atr_mult", 2.0)),
+                sl_atr_mult=float(cfg["signals"]["sl_atr_mult"]),
             )
-            tp = float(price + float(sig.get("tp_atr_mult", 3.0)) * atr)
+            tp = float(price + float(cfg["signals"]["tp_atr_mult"]) * atr)
 
         ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
-        model_id = (meta or {}).get("model_id") or "no_model"
+        model_id = meta["model_id"] if meta else "no_model"
 
+        # structured explanation (dashboard can parse/trim)
         expl = [
-            f"{name}",
-            f"serie={ex}:{sym}",
+            f"name={name}",
+            f"series={ex}:{sym}",
             f"model={model_id}",
-            f"proba={None if proba is None else round(float(proba),3)}",
-            f"ret_exp={None if ret_exp is None else round(float(ret_exp),4)}",
-            f"ev_bps={None if ev is None else round(float(ev),2)}",
+            f"proba={None if proba is None else round(float(proba),6)}",
+            f"ret_exp={None if ret_exp is None else round(float(ret_exp),6)}",
+            f"risk_est={None if risk_est is None else round(float(risk_est),6)}",
+            f"ev_bps={None if ev is None else round(float(ev),6)}",
+            f"pre_action={pre_action}",
+            f"tier={tier}",
+            f"reason={reason}",
         ]
-        if m:
-            expl.append(
-                f"robust(n={m.get('n_test')},sh={round(float(m.get('sharpe')),2)},dd={round(float(m.get('max_dd')),2)},hit={round(float(m.get('hit_rate')),2)})"
-            )
-        expl.append(f"buy_gate={ok_reason}")
 
         upsert_signal_1d(
             engine,
@@ -290,7 +292,7 @@ def main():
         )
 
         processed += 1
-        print(f"[SCORE OK] {name} -> {action} ({ex}:{sym}) gate={ok_reason}")
+        print(f"[SCORE OK] {name} -> {action} ({ex}:{sym}) tier={tier} reason={reason}")
 
     print(f"SCORE OK: {processed} inst")
 
