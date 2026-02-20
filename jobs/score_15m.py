@@ -19,8 +19,8 @@ ROBUST_MIN_HITRATE = 0.52
 # Instead of a single hard floor, we use two tiers:
 # - HARD: blocks BUY entirely
 # - SOFT: allows BUY but will reduce sizing / add warning
-ROBUST_MAX_DD_HARD = -0.65
-ROBUST_MAX_DD_SOFT = -0.35
+ROBUST_MAX_DD_HARD = -0.80
+ROBUST_MAX_DD_SOFT = -0.55
 
 
 def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
