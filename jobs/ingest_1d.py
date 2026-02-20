@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import pandas as pd
 import requests
 from sqlalchemy import text
@@ -8,16 +9,24 @@ from sqlalchemy import text
 from core.config import load_config
 from core.db import get_engine
 
-# ---- VERSION MARKER (para verificar que este archivo es el que se está ejecutando)
-VERSION_MARKER = "INGEST_1D v2 (STOOQ + YAHOO fallback + debug logs)"
 
-# Limita el backfill inicial para no timeoutear
+# 2500 filas ~ ~10 años bursátiles (252 sesiones/año)
 INITIAL_MAX_ROWS = 2500
+
+# Buenas prácticas en CI
+HTTP_TIMEOUT = 30
+UA = "Mozilla/5.0 (compatible; TradingMonitor/1.0; +https://github.com/)"
+
+session = requests.Session()
+session.headers.update({"User-Agent": UA})
 
 
 def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
+    """
+    STOOQ CSV daily: https://stooq.com/q/d/l/?s=pg.us&i=d
+    """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    r = requests.get(url, timeout=30)
+    r = session.get(url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     if df.empty or "Date" not in df.columns:
@@ -38,55 +47,44 @@ def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
     return df[["ts", "open", "high", "low", "close", "volume"]]
 
 
-def fetch_yahoo_daily(ticker: str) -> pd.DataFrame:
-    # Import aquí dentro para que si no está instalado, lo veamos en el log del WARN
-    import yfinance as yf
-
-    df = yf.download(
-        tickers=ticker,
-        period="max",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
+def fetch_yahoo_daily_chart(ticker: str, range_: str = "10y") -> pd.DataFrame:
+    """
+    Yahoo public JSON chart endpoint (no API key, usually works in GitHub Actions):
+    https://query2.finance.yahoo.com/v8/finance/chart/LUN.TO?range=10y&interval=1d&includePrePost=false&events=div%7Csplit
+    """
+    url = (
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"?range={range_}&interval=1d&includePrePost=false&events=div%7Csplit"
     )
+    r = session.get(url, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    j = r.json()
 
-    if df is None or df.empty:
+    chart = (j or {}).get("chart", {})
+    if chart.get("error"):
         return pd.DataFrame()
 
-    df = df.reset_index()
-
-    if "Date" in df.columns:
-        ts_col = "Date"
-    elif "Datetime" in df.columns:
-        ts_col = "Datetime"
-    else:
-        ts_col = df.columns[0]
-
-    rename = {}
-    for c in df.columns:
-        cl = str(c).lower()
-        if cl == ts_col.lower():
-            rename[c] = "ts"
-        elif cl == "open":
-            rename[c] = "open"
-        elif cl == "high":
-            rename[c] = "high"
-        elif cl == "low":
-            rename[c] = "low"
-        elif cl == "close":
-            rename[c] = "close"
-        elif cl == "volume":
-            rename[c] = "volume"
-
-    df = df.rename(columns=rename)
-
-    need = {"ts", "open", "high", "low", "close", "volume"}
-    if not need.issubset(set(df.columns)):
+    result = (chart.get("result") or [])
+    if not result:
         return pd.DataFrame()
 
-    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    df = df.dropna(subset=["ts"]).sort_values("ts")
+    res0 = result[0]
+    ts_list = res0.get("timestamp") or []
+    ind = (((res0.get("indicators") or {}).get("quote") or [None])[0]) or {}
+    if not ts_list or not ind:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(ts_list, unit="s", utc=True, errors="coerce"),
+            "open": ind.get("open"),
+            "high": ind.get("high"),
+            "low": ind.get("low"),
+            "close": ind.get("close"),
+            "volume": ind.get("volume"),
+        }
+    )
+    df = df.dropna(subset=["ts", "close"]).sort_values("ts")
     return df[["ts", "open", "high", "low", "close", "volume"]]
 
 
@@ -142,33 +140,23 @@ def resolve_daily_series(inst: dict) -> list[tuple[str, str, str]]:
     """
     candidates as (exchange, symbol, source)
     Prefer STOOQ for free daily history.
-    Fallback to YAHOO (yfinance) when STOOQ not available.
+    Then Yahoo chart as fallback (still free, no API key).
     """
     cands: list[tuple[str, str, str]] = []
 
-    # STOOQ first
+    # 1) STOOQ first
     for s in inst.get("stooq_candidates", []) or []:
-        if s:
-            cands.append(("STOOQ", s, "stooq"))
+        cands.append(("STOOQ", s, "stooq"))
 
-    # If you ever decide to encode a direct stooq symbol in primary_symbol (optional)
-    # e.g., primary_exchange: "STOOQ" and primary_symbol: "lugc.us"
-    if str(inst.get("primary_exchange", "")).upper() == "STOOQ":
-        ps = inst.get("primary_symbol")
-        if ps:
-            cands.append(("STOOQ", ps, "stooq"))
-
-    # YAHOO fallback
+    # 2) YAHOO fallback
     for y in inst.get("yahoo_candidates", []) or []:
-        if y:
-            cands.append(("YAHOO", y, "yahoo"))
+        cands.append(("YAHOO", y, "yahoo"))
 
     return cands
 
 
 def main():
-    print(f"[BOOT] {VERSION_MARKER}")
-
+    print("[BOOT] INGEST_1D v3 (STOOQ + YAHOO chart fallback)")
     cfg = load_config()
     engine = get_engine()
 
@@ -178,21 +166,23 @@ def main():
         name = inst["name"]
         asset_id = inst.get("isin") or inst.get("asset_id") or name
 
-        print(f"\n[INGEST_1D] {name}")
-        cands = resolve_daily_series(inst)
-        print(f"[CANDS] {name}: {cands}")
+        print(f"[INGEST_1D] {name}")
+
+        candidates = resolve_daily_series(inst)
+        print(f"[CANDS] {name}: {candidates}")
 
         ok = False
         last_err = None
 
-        for ex, sym, src in cands:
+        for ex, sym, src in candidates:
             try:
                 print(f"[TRY] {name}: {ex}:{sym} src={src}")
 
                 if src == "stooq":
                     df = fetch_stooq_daily(sym)
                 elif src == "yahoo":
-                    df = fetch_yahoo_daily(sym)
+                    # Para no timeoutear, usamos 10y. Si quieres más, sube a "max".
+                    df = fetch_yahoo_daily_chart(sym, range_="10y")
                 else:
                     df = pd.DataFrame()
 
@@ -202,9 +192,11 @@ def main():
 
                 latest = get_latest_ts(engine, ex, sym)
 
+                # Incremental:
                 if latest is not None:
                     df_new = df[df["ts"] > latest].copy()
                 else:
+                    # First fill: limit rows to avoid timeouts
                     df_new = df.tail(INITIAL_MAX_ROWS).copy()
 
                 if df_new.empty:
@@ -221,12 +213,14 @@ def main():
 
             except Exception as e:
                 last_err = e
-                print(f"[WARN] {name} {ex}:{sym} failed: {repr(e)}")
+                print(f"[WARN] {name} {ex}:{sym} failed: {e}")
+                # pequeña pausa para ser amable con endpoints públicos
+                time.sleep(0.5)
 
         if not ok:
-            print(f"[SKIP] {name}: no daily data from free sources (last_err={repr(last_err)})")
+            print(f"[SKIP] {name}: no daily data from free sources (last_err={last_err})")
 
-    print(f"\nINGEST_1D OK: {processed} assets")
+    print(f"INGEST_1D OK: {processed} assets")
 
 
 if __name__ == "__main__":
