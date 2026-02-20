@@ -32,8 +32,8 @@ def save_models(
     Guarda modelos serializados en la tabla correspondiente (15m o 1d).
 
     IMPORTANTE:
-    - psycopg2 NO soporta ':meta::jsonb' como bind.
-    - usamos %(meta)s::jsonb y pasamos meta como string JSON.
+    - NO usar %(...)s dentro del SQL.
+    - Usar :param (SQLAlchemy) y CAST(:meta AS jsonb).
     """
     import pickle
 
@@ -42,32 +42,35 @@ def save_models(
     clf_blob = pickle.dumps(clf)
     reg_blob = pickle.dumps(reg)
 
+    # Guardamos meta como string JSON y lo casteamos a jsonb en SQL
     meta_json = json.dumps(meta or {}, ensure_ascii=False)
+
+    sql = text(
+        f"""
+        insert into {table}(
+            exchange,
+            symbol,
+            model_id,
+            trained_at,
+            clf_pickle,
+            reg_pickle,
+            meta
+        )
+        values (
+            :exchange,
+            :symbol,
+            :model_id,
+            now(),
+            :clf_pickle,
+            :reg_pickle,
+            CAST(:meta AS jsonb)
+        )
+        """
+    )
 
     with engine.begin() as conn:
         conn.execute(
-            text(
-                f"""
-                insert into {table}(
-                    exchange,
-                    symbol,
-                    model_id,
-                    trained_at,
-                    clf_pickle,
-                    reg_pickle,
-                    meta
-                )
-                values (
-                    %(exchange)s,
-                    %(symbol)s,
-                    %(model_id)s,
-                    now(),
-                    %(clf_pickle)s,
-                    %(reg_pickle)s,
-                    %(meta)s::jsonb
-                )
-                """
-            ),
+            sql,
             {
                 "exchange": exchange,
                 "symbol": symbol,
@@ -115,18 +118,17 @@ def load_latest_models(
     reg = pickle.loads(row["reg_pickle"])
 
     meta = row.get("meta")
-    # meta llega ya como dict (jsonb) o como string dependiendo del driver/config
+
+    # meta puede venir como dict (jsonb) o como string
     if isinstance(meta, str):
         try:
             meta = json.loads(meta)
         except Exception:
             meta = {"raw_meta": meta}
 
-    # aseguramos que meta sea dict
     if meta is None or not isinstance(meta, dict):
         meta = {}
 
-    # si el model_id no está dentro, lo añadimos
     if "model_id" not in meta and row.get("model_id") is not None:
         meta["model_id"] = row.get("model_id")
 
