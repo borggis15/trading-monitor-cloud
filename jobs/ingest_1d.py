@@ -10,8 +10,12 @@ from core.config import load_config
 from core.db import get_engine
 
 
+# Limita el backfill inicial para no timeoutear
+# (daily: 2500 filas ~ 10 años de cotización si hay 252 sesiones/año)
+INITIAL_MAX_ROWS = 2500
+
+
 def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
-    # Stooq daily CSV: https://stooq.com/q/d/l/?s={symbol}&i=d
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -27,8 +31,21 @@ def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
         "Close": "close",
         "Volume": "volume",
     })
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    return df[["ts", "open", "high", "low", "close", "volume"]].dropna(subset=["ts"]).sort_values("ts")
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df.dropna(subset=["ts"]).sort_values("ts")
+    return df[["ts", "open", "high", "low", "close", "volume"]]
+
+
+def get_latest_ts(engine, exchange: str, symbol: str):
+    q = """
+    select max(ts) as max_ts
+    from public.bars_1d
+    where exchange=:exchange and symbol=:symbol
+    """
+    row = pd.read_sql(text(q), engine, params={"exchange": exchange, "symbol": symbol})
+    if row.empty or pd.isna(row.loc[0, "max_ts"]):
+        return None
+    return pd.to_datetime(row.loc[0, "max_ts"], utc=True, errors="coerce")
 
 
 def upsert_bars_1d(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str, asset_id: str, asset_name: str) -> int:
@@ -67,30 +84,14 @@ def upsert_bars_1d(engine, exchange: str, symbol: str, df: pd.DataFrame, source:
     return len(d)
 
 
-def resolve_daily_series(inst: dict) -> list[tuple[str,str,str]]:
+def resolve_daily_series(inst: dict) -> list[tuple[str, str, str]]:
     """
-    Returns candidates as (exchange, symbol, source)
-    Prefer STOOQ if available because it gives long daily history.
-    You can add more candidates later.
+    candidates as (exchange, symbol, source)
+    Prefer STOOQ for free daily history.
     """
     cands = []
-
-    # Prefer stooq_candidates first if present
     for s in inst.get("stooq_candidates", []) or []:
         cands.append(("STOOQ", s, "stooq"))
-
-    # Yahoo daily can be added later if you want (yfinance), but stooq is enough for free daily growth.
-
-    # As a final fallback, try xetra symbol via stooq as-is (sometimes works)
-    xs = inst.get("xetra_symbol")
-    if xs:
-        cands.append(("XETR", xs.lower(), "stooq"))  # sometimes stooq uses lowercase, but depends
-
-    # Primary fallback as stooq too (many US tickers exist)
-    ps = inst.get("primary_symbol")
-    if ps:
-        cands.append(("PRIMARY", ps.lower(), "stooq"))
-
     return cands
 
 
@@ -109,16 +110,27 @@ def main():
         ok = False
         for ex, sym, src in resolve_daily_series(inst):
             try:
-                if src == "stooq":
-                    df = fetch_stooq_daily(sym)
-                else:
-                    df = pd.DataFrame()
-
+                df = fetch_stooq_daily(sym) if src == "stooq" else pd.DataFrame()
                 if df is None or df.empty:
                     continue
 
-                n = upsert_bars_1d(engine, ex, sym, df, source=src, asset_id=asset_id, asset_name=name)
-                print(f"[OK] {name}: {ex}:{sym} {n} rows ({src})")
+                latest = get_latest_ts(engine, ex, sym)
+
+                # ✅ Incremental:
+                if latest is not None:
+                    df_new = df[df["ts"] > latest].copy()
+                else:
+                    # ✅ First fill: limit rows to avoid timeouts
+                    df_new = df.tail(INITIAL_MAX_ROWS).copy()
+
+                if df_new.empty:
+                    print(f"[OK] {name}: {ex}:{sym} no new rows")
+                    ok = True
+                    processed += 1
+                    break
+
+                n = upsert_bars_1d(engine, ex, sym, df_new, source=src, asset_id=asset_id, asset_name=name)
+                print(f"[OK] {name}: {ex}:{sym} inserted={n} (latest_in_db={latest})")
                 ok = True
                 processed += 1
                 break
