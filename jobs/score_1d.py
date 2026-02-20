@@ -11,15 +11,18 @@ from core.ml import predict
 from core.risk import size_from_atr, ev_bps
 from core.model_store import load_latest_models
 
+# --- Performance / robustness knobs ---
+# Para scoring diario: ventana suficiente para indicadores + estabilidad, pero rápida.
+SCORE_MAX_BARS = 700          # ~2.7 años de diario si fuese 252/año (sobrado)
+FEATURES_UPSERT_ROWS = 5      # guardamos solo las últimas N filas (no miles)
 
-# Reglas de robustez (puedes ajustar si quieres)
 ROBUST_MIN_NTEST = 60
 ROBUST_MIN_SHARPE = 1.0
 ROBUST_MIN_HITRATE = 0.52
-ROBUST_MAX_DD_FLOOR = -0.65  # daily suele tolerar DD peor, pero esto es “hard gate”
+ROBUST_MAX_DD_FLOOR = -0.35
 
 
-def read_bars_1d(engine, exchange: str, symbol: str) -> pd.DataFrame:
+def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
     df = pd.read_sql(
         text(
             """
@@ -38,7 +41,7 @@ def read_bars_1d(engine, exchange: str, symbol: str) -> pd.DataFrame:
     return df.set_index("ts").sort_index()
 
 
-def read_latest_metrics_1d(engine, exchange: str, symbol: str):
+def read_latest_metrics(engine, exchange: str, symbol: str):
     row = pd.read_sql(
         text(
             """
@@ -57,14 +60,25 @@ def read_latest_metrics_1d(engine, exchange: str, symbol: str):
     return row.iloc[0].to_dict()
 
 
-def upsert_features_1d(engine, exchange: str, symbol: str, feat: pd.DataFrame):
+def upsert_features(engine, exchange: str, symbol: str, feat: pd.DataFrame) -> int:
+    """
+    Guardamos SOLO últimas filas (features recientes) para depurar/monitorizar.
+    No tiene sentido reinsertar miles de filas en cada score.
+    """
     if feat is None or feat.empty:
         return 0
 
     f = feat.copy().reset_index()
+    if "ts" not in f.columns:
+        # por seguridad si el índice no se llama ts
+        f = f.rename(columns={"index": "ts"})
+
     f["ts"] = pd.to_datetime(f["ts"], utc=True)
     f["exchange"] = exchange
     f["symbol"] = symbol
+
+    # Nos quedamos con las últimas N filas
+    f = f.sort_values("ts").tail(FEATURES_UPSERT_ROWS)
 
     cols = ["exchange", "symbol", "ts", "rsi", "ema_fast", "ema_slow", "atr", "zscore", "ret_fwd"]
     for c in cols:
@@ -91,7 +105,7 @@ def upsert_features_1d(engine, exchange: str, symbol: str, feat: pd.DataFrame):
     return len(f)
 
 
-def upsert_signal_1d(engine, row: dict):
+def upsert_signal(engine, row: dict):
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -128,17 +142,27 @@ def upsert_signal_1d(engine, row: dict):
         )
 
 
-def resolve_series_1d(engine, inst: dict) -> tuple[str | None, str | None]:
-    candidates: list[tuple[str, str]] = []
+def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
+    candidates = []
 
+    # XETR primero
+    candidates.append(("XETR", inst.get("xetra_symbol")))
+
+    # STOOQ
     for c in inst.get("stooq_candidates", []) or []:
         candidates.append(("STOOQ", c))
 
+    # YAHOO
     for y in inst.get("yahoo_candidates", []) or []:
         candidates.append(("YAHOO", y))
 
+    # PRIMARY último
+    candidates.append(("PRIMARY", inst.get("primary_symbol")))
+
     for ex, sym in candidates:
-        bars = read_bars_1d(engine, ex, sym)
+        if not ex or not sym:
+            continue
+        bars = read_bars(engine, ex, sym)
         if bars is not None and not bars.empty:
             print(f"[SERIES] {inst['name']} using {ex}:{sym} bars={len(bars)}")
             return ex, sym
@@ -148,7 +172,7 @@ def resolve_series_1d(engine, inst: dict) -> tuple[str | None, str | None]:
 
 def robust_ok_for_buy(m: dict | None) -> tuple[bool, str]:
     if not m:
-        return False, "no_metrics"
+        return False, "no metrics"
 
     n_test = m.get("n_test")
     sharpe = m.get("sharpe")
@@ -171,7 +195,7 @@ def robust_ok_for_buy(m: dict | None) -> tuple[bool, str]:
         ok = False
         reasons.append(f"max_dd<{ROBUST_MAX_DD_FLOOR}")
 
-    return ok, ("ok" if ok else ",".join(reasons))
+    return ok, ("ok" if ok else ", ".join(reasons))
 
 
 def main():
@@ -186,24 +210,28 @@ def main():
         asset_id = inst.get("isin") or inst.get("asset_id") or name
         asset_name = name
 
-        ex, sym = resolve_series_1d(engine, inst)
+        ex, sym = resolve_series(engine, inst)
         if not ex or not sym:
             print(f"[SCORE SKIP] {name}: no daily bars in DB")
             continue
 
-        bars = read_bars_1d(engine, ex, sym)
+        bars = read_bars(engine, ex, sym)
         if bars is None or bars.empty:
-            print(f"[SCORE SKIP] {name}: empty bars")
+            print(f"[SCORE SKIP] {name}: no daily bars in DB")
             continue
+
+        # ✅ performance: usamos solo ventana reciente para features / scoring
+        bars = bars.tail(SCORE_MAX_BARS)
 
         feat = compute_features(bars, horizon_bars=horizon_days)
         if feat is None or feat.empty:
-            print(f"[SCORE SKIP] {name}: empty features")
+            print(f"[SCORE SKIP] {name}: features empty")
             continue
 
-        upsert_features_1d(engine, ex, sym, feat)
+        # Guardamos solo últimas features (monitorización)
+        upsert_features(engine, ex, sym, feat)
 
-        clf, reg, meta = load_latest_models(engine, ex, sym)  # si quieres, luego hacemos load_latest_models_1d
+        clf, reg, meta = load_latest_models(engine, ex, sym)
         proba, ret_exp = predict(clf, reg, feat)
 
         last = feat.dropna().tail(1)
@@ -228,7 +256,7 @@ def main():
             elif proba < 0.45 and ev < -2.0:
                 action = "SELL"
 
-        m = read_latest_metrics_1d(engine, ex, sym)
+        m = read_latest_metrics(engine, ex, sym)
         ok_buy, ok_reason = robust_ok_for_buy(m)
         if action == "BUY" and not ok_buy:
             action = "HOLD"
@@ -257,14 +285,10 @@ def main():
             f"proba={None if proba is None else round(float(proba),3)}",
             f"ret_exp={None if ret_exp is None else round(float(ret_exp),4)}",
             f"ev_bps={None if ev is None else round(float(ev),2)}",
-            f"buy_gate={ok_reason}",
+            f"gate={ok_reason}",
         ]
-        if m:
-            expl.append(
-                f"robust(n={m.get('n_test')},sh={round(float(m.get('sharpe')),2)},dd={round(float(m.get('max_dd')),2)},hit={round(float(m.get('hit_rate')),2)})"
-            )
 
-        upsert_signal_1d(engine, {
+        upsert_signal(engine, {
             "exchange": ex,
             "symbol": sym,
             "ts": ts,
