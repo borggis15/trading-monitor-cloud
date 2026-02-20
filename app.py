@@ -4,7 +4,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
 
-st.set_page_config(page_title="Trading Monitor Pro", layout="wide")
+st.set_page_config(page_title="Trading Monitor Pro (1D)", layout="wide")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
@@ -58,7 +58,9 @@ def trend_from_ret(ret_exp):
 
 def confidence_score(proba_up, sharpe, n_test):
     """
-    Score orientativo 0-100 para UI (resumen, no “verdad”).
+    0-100 orientativo para UI:
+    - proba_up domina
+    - sharpe y n_test suman suavemente
     """
     p = num(proba_up)
     sh = num(sharpe)
@@ -73,9 +75,23 @@ def confidence_score(proba_up, sharpe, n_test):
         sh_bonus = max(0.0, min(1.0, sh / 10.0)) * 20.0  # 0..20
     nt_bonus = 0.0
     if nt is not None:
-        nt_bonus = max(0.0, min(1.0, nt / 250.0)) * 10.0  # 0..10
+        nt_bonus = max(0.0, min(1.0, nt / 300.0)) * 10.0  # 0..10
 
     return round(min(100.0, base + sh_bonus + nt_bonus), 0)
+
+def horizon_days_from_row(row):
+    h = row.get("horizon", None)
+    if isinstance(h, str):
+        # esperado "10d"
+        if h.endswith("d"):
+            try:
+                return int(h[:-1])
+            except Exception:
+                return 10
+    hv = num(h)
+    if hv is not None and hv > 0:
+        return int(hv)
+    return 10
 
 def expected_pnl_eur(size_eur, ret_exp):
     s = num(size_eur)
@@ -84,76 +100,20 @@ def expected_pnl_eur(size_eur, ret_exp):
         return None
     return s * r
 
-def parse_explanation(expl: str):
-    """
-    explanation actual:
-    name=... | series=... | model=... | proba=... | ret_exp=... | risk_est=... | ev_bps=...
-    | pre_action=... | tier=... | reason=...
-    """
-    out = {}
-    if not expl:
-        return out
-    parts = [p.strip() for p in expl.split("|")]
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
-
-def concise_rationale(row: dict):
-    """
-    Texto profesional, corto, sin ruido.
-    """
-    action = (row.get("action") or "HOLD").upper()
-    ev = row.get("ev_bps")
-    ret_exp = row.get("ret_exp")
-    expl = parse_explanation(row.get("explanation") or "")
-    tier = expl.get("tier")
-    reason = expl.get("reason")
-
-    t = trend_from_ret(ret_exp)
-
-    if action == "BUY":
-        base = f"Bias: {t}. Candidate entry if your risk rules allow it."
-        if tier and tier != "none":
-            base += f" Note: gated ({tier}) — {reason}."
-        return base
-
-    if action == "SELL":
-        base = f"Bias: {t}. Avoid new entries; if holding, consider reducing/exiting."
-        if tier and tier != "none":
-            base += f" Note: gated ({tier}) — {reason}."
-        return base
-
-    # HOLD
-    if ev is not None and num(ev) is not None and num(ev) > 200:
-        base = f"Bias: {t}. Positive EV but held back by robustness gate."
-    else:
-        base = f"Bias: {t}. No clear edge; wait for the next update."
-    if tier and tier != "none":
-        base += f" Gate: {reason}."
-    return base
-
 # ----------------------------
-# Loaders (15m / 1d)
+# Loaders (1D)
 # ----------------------------
 @st.cache_data(ttl=60)
-def load_signals_current(tf: str):
-    if tf == "1d":
-        view = "public.signals_1d_current_by_asset"
-    else:
-        view = "public.signals_current_by_asset"
-
-    q = f"""
+def load_signals_current_1d():
+    q = """
     select
       asset_name, asset_id,
       exchange, symbol, ts,
       action, ev_bps,
-      proba_up, ret_exp,
-      risk_est,
+      proba_up, ret_exp, risk_est,
       size_eur, sl_price, tp_price,
       horizon, explanation, model_id
-    from {view}
+    from public.signals_1d_current_by_asset
     order by asset_name;
     """
     df = pd.read_sql(text(q), engine)
@@ -162,20 +122,12 @@ def load_signals_current(tf: str):
     return df
 
 @st.cache_data(ttl=120)
-def load_latest_metrics(tf: str):
-    # Si tienes tabla separada para 1d (model_metrics_1d), cámbiala aquí.
-    # Ahora mismo tu train_weekly_1d inserta en model_metrics (según tu log original),
-    # así que seguimos usando model_metrics.
+def load_latest_metrics_1d():
     q = """
-    with ranked as (
-      select *,
-        row_number() over (partition by exchange, symbol order by trained_at desc) as rn
-      from public.model_metrics
-    )
-    select exchange, symbol, model_id as metrics_model_id, trained_at,
-           sharpe, max_dd, hit_rate, profit_factor, n_test, notes
-    from ranked
-    where rn=1
+    select
+      exchange, symbol, metrics_model_id, trained_at,
+      sharpe, max_dd, hit_rate, profit_factor, n_test, notes
+    from public.model_metrics_1d_latest
     """
     df = pd.read_sql(text(q), engine)
     if not df.empty:
@@ -183,16 +135,19 @@ def load_latest_metrics(tf: str):
     return df
 
 @st.cache_data(ttl=60)
-def load_bars(tf: str, exchange: str, symbol: str, limit: int = 900):
-    table = "public.bars_1d" if tf == "1d" else "public.bars_15m"
-    q = f"""
+def load_bars_1d(exchange, symbol, limit=2500):
+    q = """
     select ts, open, high, low, close, volume
-    from {table}
+    from public.bars_1d
     where exchange=:exchange and symbol=:symbol
     order by ts desc
     limit :limit
     """
-    df = pd.read_sql(text(q), engine, params={"exchange": exchange, "symbol": symbol, "limit": int(limit)})
+    df = pd.read_sql(
+        text(q),
+        engine,
+        params={"exchange": exchange, "symbol": symbol, "limit": int(limit)},
+    )
     if df.empty:
         return df
     df["ts"] = to_dt_utc(df["ts"])
@@ -200,16 +155,19 @@ def load_bars(tf: str, exchange: str, symbol: str, limit: int = 900):
     return df
 
 @st.cache_data(ttl=60)
-def load_signal_history(tf: str, exchange: str, symbol: str, limit: int = 250):
-    table = "public.signals_1d" if tf == "1d" else "public.signals"
-    q = f"""
-    select ts, action, ev_bps, proba_up, ret_exp, size_eur, sl_price, tp_price, model_id
-    from {table}
+def load_signal_history_1d(exchange, symbol, limit=400):
+    q = """
+    select ts, action, ev_bps, proba_up, ret_exp, risk_est, size_eur, sl_price, tp_price, model_id
+    from public.signals_1d
     where exchange=:exchange and symbol=:symbol
     order by ts desc
     limit :limit
     """
-    df = pd.read_sql(text(q), engine, params={"exchange": exchange, "symbol": symbol, "limit": int(limit)})
+    df = pd.read_sql(
+        text(q),
+        engine,
+        params={"exchange": exchange, "symbol": symbol, "limit": int(limit)},
+    )
     if df.empty:
         return df
     df["ts"] = to_dt_utc(df["ts"])
@@ -217,14 +175,12 @@ def load_signal_history(tf: str, exchange: str, symbol: str, limit: int = 250):
     return df
 
 # ----------------------------
-# UI
+# Sidebar
 # ----------------------------
 st.title("Trading Monitor Pro")
 
 with st.sidebar:
     st.subheader("Controls")
-
-    tf = st.radio("Timeframe", options=["15m", "1d"], index=0, horizontal=True)
 
     if st.button("Refresh", use_container_width=True):
         st.cache_data.clear()
@@ -255,18 +211,20 @@ with st.sidebar:
 # ----------------------------
 # Load & merge
 # ----------------------------
-signals = load_signals_current(tf)
-metrics = load_latest_metrics(tf)
+signals = load_signals_current_1d()
+metrics = load_latest_metrics_1d()
 
 if signals.empty:
-    st.warning(f"No current signals yet for {tf}. Run the corresponding score workflow.")
+    st.warning("No current 1D signals. Run score_1d first.")
     st.stop()
 
 df = signals.merge(metrics, on=["exchange", "symbol"], how="left")
 
-# Coerce numeric
-for c in ["ev_bps", "proba_up", "ret_exp", "risk_est", "size_eur", "sl_price", "tp_price",
-          "sharpe", "max_dd", "hit_rate", "profit_factor", "n_test"]:
+# Numeric coercion
+for c in [
+    "ev_bps", "proba_up", "ret_exp", "risk_est", "size_eur", "sl_price", "tp_price",
+    "sharpe", "max_dd", "hit_rate", "profit_factor", "n_test"
+]:
     if c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -288,7 +246,7 @@ elif sort_by == "Sharpe":
 elif sort_by == "Hit rate":
     df_rank = df_view.sort_values("hit_rate", ascending=False)
 elif sort_by == "Max DD":
-    df_rank = df_view.sort_values("max_dd", ascending=True)
+    df_rank = df_view.sort_values("max_dd", ascending=True)  # less negative is better
 elif sort_by == "n_test":
     df_rank = df_view.sort_values("n_test", ascending=False)
 else:
@@ -298,9 +256,11 @@ else:
 # Urgency banner
 # ----------------------------
 urgent = df.copy()
-urgent = urgent[(urgent["action"] == "BUY") &
-                (urgent["ev_bps"].fillna(-1e9) >= urgent_ev) &
-                (urgent["confidence"].fillna(0) >= urgent_conf)].copy()
+urgent = urgent[
+    (urgent["action"] == "BUY") &
+    (urgent["ev_bps"].fillna(-1e9) >= urgent_ev) &
+    (urgent["confidence"].fillna(0) >= urgent_conf)
+].copy()
 
 if not urgent.empty:
     top = urgent.sort_values(["ev_bps", "confidence"], ascending=False).iloc[0]
@@ -321,9 +281,9 @@ k4.metric("SELL", int((df["action"] == "SELL").sum()))
 st.divider()
 
 # ----------------------------
-# Cards (professional & not dense)
+# Cards
 # ----------------------------
-st.subheader(f"Current signals ({tf})")
+st.subheader("Current signals (1d)")
 
 cols = st.columns(3)
 cards = df_rank.sort_values("asset_name").to_dict(orient="records")
@@ -335,7 +295,11 @@ for i, r in enumerate(cards):
             ex = r.get("exchange") or "—"
             sym = r.get("symbol") or "—"
             action_txt, color = action_style(r.get("action"))
+            h_days = horizon_days_from_row(r)
+
             ts = r.get("ts")
+            entry_ts = ts if pd.notna(ts) else None
+            exit_ts = (entry_ts + pd.Timedelta(days=h_days)) if entry_ts is not None else None
 
             size_eur = num(r.get("size_eur"))
             if size_eur is None and default_size > 0:
@@ -344,7 +308,7 @@ for i, r in enumerate(cards):
             pnl_eur = expected_pnl_eur(size_eur, r.get("ret_exp"))
 
             st.markdown(f"**{name}**")
-            st.caption(f"{ex}:{sym} · model {r.get('model_id','—')}")
+            st.caption(f"{ex}:{sym} · model {r.get('model_id','—')} · horizon {h_days}d")
 
             c1, c2, c3 = st.columns([1.0, 1.1, 1.1])
             with c1:
@@ -363,14 +327,26 @@ for i, r in enumerate(cards):
             with c4:
                 st.metric("Exp. return", fmt_pct(r.get("ret_exp"), 2))
             with c5:
-                st.metric("Size (€)", fmt(size_eur, 0))
+                st.metric("Suggested size (€)", fmt(size_eur, 0))
             with c6:
                 st.metric("Exp. P&L (€)", fmt(pnl_eur, 0))
 
-            st.write(concise_rationale(r))
+            if entry_ts is not None:
+                st.caption(
+                    f"Window: entry {entry_ts.strftime('%Y-%m-%d')} → target {exit_ts.strftime('%Y-%m-%d') if exit_ts is not None else '—'} (UTC)"
+                )
+            else:
+                st.caption("Window: —")
 
-            if pd.notna(ts):
-                st.caption(f"Signal time (UTC): {ts.strftime('%Y-%m-%d %H:%M')}")
+            tlabel = trend_from_ret(r.get("ret_exp"))
+            if action_txt == "BUY":
+                st.write(f"Trend: {tlabel}. Plan: enter within the window; exit on SELL signal or at target date.")
+                if pd.notna(r.get("sl_price")) or pd.notna(r.get("tp_price")):
+                    st.caption(f"Risk levels: SL {fmt(r.get('sl_price'),2)} · TP {fmt(r.get('tp_price'),2)}")
+            elif action_txt == "SELL":
+                st.write(f"Trend: {tlabel}. Plan: avoid new entries; if holding, reduce/exit on next liquidity window.")
+            else:
+                st.write(f"Trend: {tlabel}. Plan: wait; reassess on next update or if confidence increases.")
 
             with st.expander("Technical details"):
                 st.code((r.get("explanation") or "").strip(), language="text")
@@ -378,41 +354,44 @@ for i, r in enumerate(cards):
 st.divider()
 
 # ----------------------------
-# Ranking
+# Ranking table
 # ----------------------------
 st.subheader("Ranking")
 
-show_cols = [
+rank_cols = [
     "asset_name", "exchange", "symbol", "action",
     "ev_bps", "confidence", "proba_up", "ret_exp", "risk_est",
     "sharpe", "max_dd", "hit_rate", "n_test",
     "model_id"
 ]
-st.dataframe(df_rank[show_cols], use_container_width=True)
+
+df_show = df_rank.copy()
+for col in ["ev_bps", "proba_up", "ret_exp", "risk_est", "sharpe", "max_dd", "hit_rate", "confidence"]:
+    if col in df_show.columns:
+        df_show[col] = df_show[col].round(4)
+
+st.dataframe(df_show[rank_cols], use_container_width=True, hide_index=True)
 
 st.divider()
 
 # ----------------------------
-# Detail by asset (chart first)
+# Asset detail (chart first)
 # ----------------------------
 st.subheader("Asset detail")
 
 names = df_rank["asset_name"].tolist() if not df_rank.empty else df["asset_name"].tolist()
-if not names:
-    st.info("No assets under current filters.")
-    st.stop()
-
 sel = st.selectbox("Select an asset", options=names, index=0)
+
 row = df[df["asset_name"] == sel].iloc[0]
 ex = row["exchange"]
 sym = row["symbol"]
+h_days = horizon_days_from_row(row)
 
-bars = load_bars(tf, ex, sym, limit=1200 if tf == "15m" else 2000)
-hist = load_signal_history(tf, ex, sym, limit=250)
+bars = load_bars_1d(ex, sym, limit=3000)
+hist = load_signal_history_1d(ex, sym, limit=600)
 
-# Chart FIRST
 if bars.empty:
-    st.warning("No bars available for this asset.")
+    st.warning("No daily bars available for this asset.")
 else:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=bars["ts"], y=bars["close"], mode="lines", name="Close"))
@@ -439,13 +418,12 @@ else:
     fig.update_layout(height=540, margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-# Summary BELOW
 left, right = st.columns([1, 1], vertical_alignment="top")
 
 with left:
     action_txt, color = action_style(row.get("action"))
     st.markdown(f"**{row.get('asset_name','—')}**")
-    st.caption(f"{ex}:{sym} · timeframe {tf} · model {row.get('model_id','—')}")
+    st.caption(f"{ex}:{sym} · horizon {h_days}d · model {row.get('model_id','—')}")
 
     st.markdown(
         f"<div style='display:inline-block;padding:6px 10px;border-radius:999px;background:{color};color:white;font-weight:700;'>"
@@ -458,7 +436,6 @@ with left:
     st.write(f"Expected return: {fmt_pct(row.get('ret_exp'),2)} ({trend_from_ret(row.get('ret_exp'))})")
     st.write(f"Risk estimate: {fmt(row.get('risk_est'),4)}")
     st.write(f"Confidence: {int(row.get('confidence'))}/100" if pd.notna(row.get("confidence")) else "Confidence: —")
-    st.write(concise_rationale(row.to_dict()))
 
 with right:
     st.markdown("Backtest robustness (latest)")
@@ -466,7 +443,8 @@ with right:
     st.write(f"Max drawdown: {fmt(row.get('max_dd'),2)}")
     st.write(f"Hit rate: {fmt(row.get('hit_rate'),2)}")
     st.write(f"n_test: {int(row.get('n_test')) if pd.notna(row.get('n_test')) else '—'}")
-    st.caption(f"Trained at (UTC): {row.get('trained_at','—')}")
+    trained = row.get("trained_at")
+    st.caption(f"Trained at (UTC): {trained if pd.notna(trained) else '—'}")
 
 with st.expander("Technical details"):
     st.code((row.get("explanation") or "").strip(), language="text")
