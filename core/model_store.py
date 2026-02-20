@@ -1,76 +1,35 @@
-# core/model_store.py
 from __future__ import annotations
 
 import json
-import pandas as pd
+import pickle
 from sqlalchemy import text
-from typing import Any, Tuple
 
 
-def _table_for_tf(tf: str | None) -> str:
+def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, meta: dict, tf: str = "15m"):
     """
-    tf:
-      - None / "15m" -> model_store
-      - "1d"        -> model_store_1d
+    Guarda en:
+      public.model_store      (tf=15m)
+      public.model_store_1d   (tf=1d)
     """
-    if (tf or "").lower() in ("1d", "daily"):
-        return "public.model_store_1d"
-    return "public.model_store"
-
-
-def save_models(
-    engine,
-    exchange: str,
-    symbol: str,
-    model_id: str,
-    clf: Any,
-    reg: Any,
-    meta: dict,
-    tf: str | None = None,
-):
-    """
-    Guarda modelos serializados en la tabla correspondiente (15m o 1d).
-
-    IMPORTANTE:
-    - NO usar %(...)s dentro del SQL.
-    - Usar :param (SQLAlchemy) y CAST(:meta AS jsonb).
-    """
-    import pickle
-
-    table = _table_for_tf(tf)
+    table = "public.model_store_1d" if tf == "1d" else "public.model_store"
 
     clf_blob = pickle.dumps(clf)
     reg_blob = pickle.dumps(reg)
-
-    # Guardamos meta como string JSON y lo casteamos a jsonb en SQL
-    meta_json = json.dumps(meta or {}, ensure_ascii=False)
-
-    sql = text(
-        f"""
-        insert into {table}(
-            exchange,
-            symbol,
-            model_id,
-            trained_at,
-            clf_pickle,
-            reg_pickle,
-            meta
-        )
-        values (
-            :exchange,
-            :symbol,
-            :model_id,
-            now(),
-            :clf_pickle,
-            :reg_pickle,
-            CAST(:meta AS jsonb)
-        )
-        """
-    )
+    meta_json = json.dumps(meta or {})
 
     with engine.begin() as conn:
         conn.execute(
-            sql,
+            text(
+                f"""
+                insert into {table}(exchange, symbol, model_id, trained_at, clf_pickle, reg_pickle, meta)
+                values (:exchange, :symbol, :model_id, now(), :clf_pickle, :reg_pickle, cast(:meta as jsonb))
+                on conflict (exchange, symbol, model_id) do update set
+                  trained_at = excluded.trained_at,
+                  clf_pickle = excluded.clf_pickle,
+                  reg_pickle = excluded.reg_pickle,
+                  meta = excluded.meta
+                """
+            ),
             {
                 "exchange": exchange,
                 "symbol": symbol,
@@ -82,54 +41,32 @@ def save_models(
         )
 
 
-def load_latest_models(
-    engine,
-    exchange: str,
-    symbol: str,
-    tf: str | None = None,
-) -> Tuple[Any, Any, dict | None]:
+def load_latest_models(engine, exchange: str, symbol: str, tf: str = "15m"):
     """
-    Carga el último modelo entrenado para exchange/symbol desde la tabla correspondiente (15m o 1d).
-    Devuelve: (clf, reg, meta)
+    Devuelve (clf, reg, meta) del modelo más reciente por trained_at.
     """
-    import pickle
+    table = "public.model_store_1d" if tf == "1d" else "public.model_store"
 
-    table = _table_for_tf(tf)
-
-    df = pd.read_sql(
+    row = engine.execute(
         text(
             f"""
-            select clf_pickle, reg_pickle, meta, model_id, trained_at
+            select model_id, clf_pickle, reg_pickle, meta, trained_at
             from {table}
             where exchange=:exchange and symbol=:symbol
             order by trained_at desc
             limit 1
             """
         ),
-        engine,
-        params={"exchange": exchange, "symbol": symbol},
-    )
+        {"exchange": exchange, "symbol": symbol},
+    ).fetchone()
 
-    if df.empty:
+    if not row:
         return None, None, None
 
-    row = df.iloc[0]
-    clf = pickle.loads(row["clf_pickle"])
-    reg = pickle.loads(row["reg_pickle"])
+    model_id, clf_blob, reg_blob, meta, _trained_at = row
+    clf = pickle.loads(clf_blob) if clf_blob is not None else None
+    reg = pickle.loads(reg_blob) if reg_blob is not None else None
+    meta = dict(meta) if meta is not None else {}
 
-    meta = row.get("meta")
-
-    # meta puede venir como dict (jsonb) o como string
-    if isinstance(meta, str):
-        try:
-            meta = json.loads(meta)
-        except Exception:
-            meta = {"raw_meta": meta}
-
-    if meta is None or not isinstance(meta, dict):
-        meta = {}
-
-    if "model_id" not in meta and row.get("model_id") is not None:
-        meta["model_id"] = row.get("model_id")
-
+    meta["model_id"] = model_id
     return clf, reg, meta
