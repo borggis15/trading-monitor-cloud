@@ -25,7 +25,14 @@ universe:
     xetra_symbol: GXD
     primary_symbol: LUN
     primary_exchange: "XTSE"
-    stooq_candidates: ["lun.ca", "lun.to", "lumnf.us", "lumnf", "lun", "lundin"]
+
+    # 1D: necesitamos un ticker que exista en STOOQ (gratis).
+    # STOOQ no ofrece LUN.TO. Usamos Lundin Gold (proxy gratuito y estable).
+    # Si no quieres proxy, déjalo fuera del pipeline 1D.
+    stooq_candidates: ["lugc.us"]
+
+    # mantenemos yahoo_candidates por si en el futuro vuelve a funcionar gratis,
+    # pero hoy está fallando con YFTzMissingError.
     yahoo_candidates: ["LUN.TO", "LUNMF"]
 
   - name: GE Vernova
