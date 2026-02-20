@@ -1,13 +1,13 @@
 name: ingest_1d
 on:
   schedule:
-    - cron: "15 2 * * *"   # 02:15 UTC todos los días
+    - cron: "15 2 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,7 +16,7 @@ jobs:
           cache: "pip"
       - name: Install
         run: pip install -r requirements.txt
-      - name: Ingest daily
+      - name: Ingest daily (incremental)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -u -m jobs.ingest_1d
