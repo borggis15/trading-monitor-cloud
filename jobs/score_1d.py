@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from datetime import datetime, timezone
@@ -8,11 +7,16 @@ from datetime import datetime, timezone
 from core.config import load_config
 from core.db import get_engine
 from core.features import compute_features
-from core.ml import train_models, predict
-from core.risk import ev_bps
+from core.ml import predict
+from core.risk import size_from_atr, ev_bps
+from core.model_store import load_latest_models
 
 
-FEATURES = ["rsi", "ema_fast", "ema_slow", "atr", "zscore"]
+# Reglas de robustez (puedes ajustar si quieres)
+ROBUST_MIN_NTEST = 60
+ROBUST_MIN_SHARPE = 1.0
+ROBUST_MIN_HITRATE = 0.52
+ROBUST_MAX_DD_FLOOR = -0.65  # daily suele tolerar DD peor, pero esto es “hard gate”
 
 
 def read_bars_1d(engine, exchange: str, symbol: str) -> pd.DataFrame:
@@ -34,216 +38,255 @@ def read_bars_1d(engine, exchange: str, symbol: str) -> pd.DataFrame:
     return df.set_index("ts").sort_index()
 
 
-def load_assets_from_bars(engine) -> list[dict]:
-    # Train on whatever exists in bars_1d; this avoids mismatches.
-    df = pd.read_sql(
+def read_latest_metrics_1d(engine, exchange: str, symbol: str):
+    row = pd.read_sql(
         text(
             """
-            select distinct exchange, symbol, asset_id, asset_name
-            from public.bars_1d
+            select sharpe, max_dd, hit_rate, profit_factor, n_test, trained_at, model_id
+            from public.model_metrics_1d
+            where exchange=:exchange and symbol=:symbol
+            order by trained_at desc
+            limit 1
             """
         ),
         engine,
+        params={"exchange": exchange, "symbol": symbol},
     )
-    return df.to_dict(orient="records")
+    if row.empty:
+        return None
+    return row.iloc[0].to_dict()
 
 
-def save_models_1d(engine, exchange: str, symbol: str, model_id: str, clf, reg, meta: dict):
-    import pickle
-    clf_blob = pickle.dumps(clf)
-    reg_blob = pickle.dumps(reg)
+def upsert_features_1d(engine, exchange: str, symbol: str, feat: pd.DataFrame):
+    if feat is None or feat.empty:
+        return 0
+
+    f = feat.copy().reset_index()
+    f["ts"] = pd.to_datetime(f["ts"], utc=True)
+    f["exchange"] = exchange
+    f["symbol"] = symbol
+
+    cols = ["exchange", "symbol", "ts", "rsi", "ema_fast", "ema_slow", "atr", "zscore", "ret_fwd"]
+    for c in cols:
+        if c not in f.columns:
+            f[c] = pd.NA
 
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                insert into public.model_store_1d(exchange,symbol,model_id,trained_at,clf_pickle,reg_pickle,meta)
-                values (:exchange,:symbol,:model_id,now(),:clf_pickle,:reg_pickle,:meta::jsonb)
+                insert into public.features_1d(exchange,symbol,ts,rsi,ema_fast,ema_slow,atr,zscore,ret_fwd)
+                values (:exchange,:symbol,:ts,:rsi,:ema_fast,:ema_slow,:atr,:zscore,:ret_fwd)
+                on conflict (exchange,symbol,ts) do update set
+                  rsi=excluded.rsi,
+                  ema_fast=excluded.ema_fast,
+                  ema_slow=excluded.ema_slow,
+                  atr=excluded.atr,
+                  zscore=excluded.zscore,
+                  ret_fwd=excluded.ret_fwd
                 """
             ),
-            {
-                "exchange": exchange,
-                "symbol": symbol,
-                "model_id": model_id,
-                "clf_pickle": clf_blob,
-                "reg_pickle": reg_blob,
-                "meta": meta,
-            },
+            f[cols].to_dict(orient="records"),
         )
+    return len(f)
 
 
-def compute_walk_forward_metrics(
-    feat: pd.DataFrame,
-    min_train: int,
-    fee_bps: float,
-    slippage_bps: float,
-    max_oos_points: int = 260,   # ~1 year daily
-    retrain_every: int = 10,
-    rolling_train_window: int = 3000,
-):
-    df = feat.copy()
-    need = FEATURES + ["ret_fwd"]
-    if df is None or df.empty or any(c not in df.columns for c in need):
-        return {"n_test": 0, "hit_rate": None, "avg_ret": None, "sharpe": None, "max_dd": None, "profit_factor": None, "notes": "missing_columns"}
-
-    df = df.dropna(subset=need).copy()
-    if len(df) < (min_train + 100):
-        return {"n_test": 0, "hit_rate": None, "avg_ret": None, "sharpe": None, "max_dd": None, "profit_factor": None, "notes": f"too_few_rows={len(df)}"}
-
-    start = min_train
-    end = len(df) - 1
-    if (end - start) > max_oos_points:
-        start = end - max_oos_points
-
-    realized = []
-    hits = 0
-    pos_count = 0
-    in_pos = False
-    trades = 0
-
-    clf = reg = None
-
-    for step_i, i in enumerate(range(start, end)):
-        train_end = i
-        train_start = max(0, train_end - rolling_train_window)
-        train = df.iloc[train_start:train_end].copy()
-        test = df.iloc[i:i+1].copy()
-
-        if len(train) < min_train or test.empty:
-            continue
-
-        if clf is None or reg is None or (step_i % retrain_every == 0):
-            clf, reg, _ = train_models(train, model_type="hgb", min_rows=min_train)
-
-        proba, ret_exp = predict(clf, reg, test)
-
-        atr = float(test["atr"].iloc[0]) if np.isfinite(test["atr"].iloc[0]) else None
-        risk_est = 0.02 if atr else None
-        ev = ev_bps(ret_exp, risk_est, fee_bps, slippage_bps)
-
-        signal = "HOLD"
-        if proba is not None and ret_exp is not None and ev is not None:
-            if proba >= 0.62 and ev >= 5.0:
-                signal = "BUY"
-            elif proba <= 0.40 and ev <= -5.0:
-                signal = "SELL"
-
-        prev = in_pos
-        if signal == "BUY":
-            in_pos = True
-        elif signal == "SELL":
-            in_pos = False
-        if (not prev) and in_pos:
-            trades += 1
-
-        r = float(test["ret_fwd"].iloc[0])
-        strat_r = r if in_pos else 0.0
-        realized.append(strat_r)
-
-        if strat_r != 0.0:
-            pos_count += 1
-            if strat_r > 0:
-                hits += 1
-
-    if len(realized) < 60:
-        return {"n_test": int(len(realized)), "hit_rate": None, "avg_ret": None, "sharpe": None, "max_dd": None, "profit_factor": None, "notes": "too_few_oos"}
-
-    rets = np.array(realized, dtype=float)
-    avg = float(np.mean(rets))
-    std = float(np.std(rets) + 1e-12)
-    sharpe = float((avg / std) * np.sqrt(252)) if std > 0 else None
-
-    eq = np.cumprod(1.0 + rets)
-    peak = np.maximum.accumulate(eq)
-    dd = (eq / peak) - 1.0
-    max_dd = float(np.min(dd))
-
-    gains = float(rets[rets > 0].sum())
-    losses = float(abs(rets[rets < 0].sum()) + 1e-12)
-    pf = float(gains / losses) if losses > 0 else None
-
-    hit_rate = float(hits / pos_count) if pos_count > 0 else None
-
-    notes = "" if trades > 0 else "no_trades"
-    return {"n_test": int(len(rets)), "hit_rate": hit_rate, "avg_ret": avg, "sharpe": sharpe, "max_dd": max_dd, "profit_factor": pf, "notes": notes}
-
-
-def insert_metrics_1d(engine, exchange: str, symbol: str, model_id: str, trained_at: datetime, horizon: str, m: dict):
+def upsert_signal_1d(engine, row: dict):
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                insert into public.model_metrics_1d(
-                  exchange,symbol,model_id,trained_at,horizon,
-                  n_test,hit_rate,avg_ret,sharpe,max_dd,profit_factor,notes
+                insert into public.signals_1d(
+                  exchange,symbol,ts,
+                  action,proba_up,ret_exp,risk_est,ev_bps,
+                  size_eur,sl_price,tp_price,horizon,explanation,model_id,
+                  asset_id, asset_name
                 )
                 values (
-                  :exchange,:symbol,:model_id,:trained_at,:horizon,
-                  :n_test,:hit_rate,:avg_ret,:sharpe,:max_dd,:profit_factor,:notes
+                  :exchange,:symbol,:ts,
+                  :action,:proba_up,:ret_exp,:risk_est,:ev_bps,
+                  :size_eur,:sl_price,:tp_price,:horizon,:explanation,:model_id,
+                  :asset_id, :asset_name
                 )
+                on conflict (exchange,symbol,ts) do update set
+                  action=excluded.action,
+                  proba_up=excluded.proba_up,
+                  ret_exp=excluded.ret_exp,
+                  risk_est=excluded.risk_est,
+                  ev_bps=excluded.ev_bps,
+                  size_eur=excluded.size_eur,
+                  sl_price=excluded.sl_price,
+                  tp_price=excluded.tp_price,
+                  horizon=excluded.horizon,
+                  explanation=excluded.explanation,
+                  model_id=excluded.model_id,
+                  asset_id=excluded.asset_id,
+                  asset_name=excluded.asset_name
                 """
             ),
-            {
-                "exchange": exchange,
-                "symbol": symbol,
-                "model_id": model_id,
-                "trained_at": trained_at,
-                "horizon": horizon,
-                "n_test": m.get("n_test"),
-                "hit_rate": m.get("hit_rate"),
-                "avg_ret": m.get("avg_ret"),
-                "sharpe": m.get("sharpe"),
-                "max_dd": m.get("max_dd"),
-                "profit_factor": m.get("profit_factor"),
-                "notes": m.get("notes", ""),
-            },
+            row,
         )
+
+
+def resolve_series_1d(engine, inst: dict) -> tuple[str | None, str | None]:
+    candidates: list[tuple[str, str]] = []
+
+    for c in inst.get("stooq_candidates", []) or []:
+        candidates.append(("STOOQ", c))
+
+    for y in inst.get("yahoo_candidates", []) or []:
+        candidates.append(("YAHOO", y))
+
+    for ex, sym in candidates:
+        bars = read_bars_1d(engine, ex, sym)
+        if bars is not None and not bars.empty:
+            print(f"[SERIES] {inst['name']} using {ex}:{sym} bars={len(bars)}")
+            return ex, sym
+
+    return None, None
+
+
+def robust_ok_for_buy(m: dict | None) -> tuple[bool, str]:
+    if not m:
+        return False, "no_metrics"
+
+    n_test = m.get("n_test")
+    sharpe = m.get("sharpe")
+    max_dd = m.get("max_dd")
+    hit = m.get("hit_rate")
+
+    reasons = []
+    ok = True
+
+    if n_test is None or int(n_test) < ROBUST_MIN_NTEST:
+        ok = False
+        reasons.append(f"n_test<{ROBUST_MIN_NTEST}")
+    if sharpe is None or float(sharpe) < ROBUST_MIN_SHARPE:
+        ok = False
+        reasons.append(f"sharpe<{ROBUST_MIN_SHARPE}")
+    if hit is None or float(hit) < ROBUST_MIN_HITRATE:
+        ok = False
+        reasons.append(f"hit_rate<{ROBUST_MIN_HITRATE}")
+    if max_dd is None or float(max_dd) < ROBUST_MAX_DD_FLOOR:
+        ok = False
+        reasons.append(f"max_dd<{ROBUST_MAX_DD_FLOOR}")
+
+    return ok, ("ok" if ok else ",".join(reasons))
 
 
 def main():
     cfg = load_config()
     engine = get_engine()
 
-    horizon_days = int(cfg["ml"]["horizon_bars"])     # en daily, esto son días
-    min_rows = max(200, int(cfg["ml"]["min_train_rows"]))  # mínimo sensato en daily
-    model_type = cfg["ml"]["model_type"]
+    processed = 0
+    horizon_days = int(cfg["ml"]["horizon_bars"])
 
-    fee_bps = float(cfg["backtest"]["fee_bps"])
-    slippage_bps = float(cfg["backtest"]["slippage_bps"])
+    for inst in cfg["universe"]:
+        name = inst["name"]
+        asset_id = inst.get("isin") or inst.get("asset_id") or name
+        asset_name = name
 
-    inserted = 0
-    assets = load_assets_from_bars(engine)
-
-    for a in assets:
-        ex = a["exchange"]
-        sym = a["symbol"]
-        name = a.get("asset_name") or f"{ex}:{sym}"
+        ex, sym = resolve_series_1d(engine, inst)
+        if not ex or not sym:
+            print(f"[SCORE SKIP] {name}: no daily bars in DB")
+            continue
 
         bars = read_bars_1d(engine, ex, sym)
-        if bars is None or bars.empty or len(bars) < min_rows + horizon_days + 50:
-            print(f"[TRAIN_1D SKIP] {name}: not enough bars ({0 if bars is None else len(bars)})")
+        if bars is None or bars.empty:
+            print(f"[SCORE SKIP] {name}: empty bars")
             continue
 
         feat = compute_features(bars, horizon_bars=horizon_days)
         if feat is None or feat.empty:
-            print(f"[TRAIN_1D SKIP] {name}: empty features")
+            print(f"[SCORE SKIP] {name}: empty features")
             continue
 
-        clf, reg, train_rows = train_models(feat, model_type=model_type, min_rows=min_rows)
-        model_id = f"{model_type}_{horizon_days}d_1d"
-        meta = {"name": name, "train_rows": int(train_rows), "horizon_days": int(horizon_days), "timeframe": "1d"}
+        upsert_features_1d(engine, ex, sym, feat)
 
-        save_models_1d(engine, ex, sym, model_id, clf, reg, meta)
+        clf, reg, meta = load_latest_models(engine, ex, sym)  # si quieres, luego hacemos load_latest_models_1d
+        proba, ret_exp = predict(clf, reg, feat)
 
-        trained_at = datetime.now(timezone.utc)
-        m = compute_walk_forward_metrics(feat, min_train=min_rows, fee_bps=fee_bps, slippage_bps=slippage_bps)
+        last = feat.dropna().tail(1)
+        risk_est = None
+        if not last.empty and "atr" in last.columns:
+            atr = float(last["atr"].iloc[0])
+            price = float(bars["close"].iloc[-1])
+            if price > 0:
+                risk_est = atr / price
 
-        insert_metrics_1d(engine, ex, sym, model_id, trained_at, f"{horizon_days}d", m)
-        inserted += 1
+        ev = ev_bps(
+            ret_exp,
+            risk_est,
+            float(cfg["backtest"]["fee_bps"]),
+            float(cfg["backtest"]["slippage_bps"]),
+        )
 
-        print(f"[METRICS_1D OK] {name} {ex}:{sym} n_test={m.get('n_test')} sharpe={m.get('sharpe')} max_dd={m.get('max_dd')} hit_rate={m.get('hit_rate')} notes={m.get('notes')}")
+        action = "HOLD"
+        if proba is not None and ret_exp is not None and ev is not None:
+            if proba > 0.60 and ev > 2.0:
+                action = "BUY"
+            elif proba < 0.45 and ev < -2.0:
+                action = "SELL"
 
-    print(f"[TRAIN_1D DONE] metrics_inserted={inserted}")
+        m = read_latest_metrics_1d(engine, ex, sym)
+        ok_buy, ok_reason = robust_ok_for_buy(m)
+        if action == "BUY" and not ok_buy:
+            action = "HOLD"
+
+        size_eur = sl = tp = None
+        if action == "BUY" and not last.empty and "atr" in last.columns:
+            atr = float(last["atr"].iloc[0])
+            price = float(bars["close"].iloc[-1])
+            size_eur, sl = size_from_atr(
+                capital_eur=float(cfg["signals"]["capital_eur"]),
+                risk_pct=float(cfg["signals"]["risk_per_trade_pct"]),
+                max_pos_pct=float(cfg["signals"]["max_position_pct"]),
+                price=price,
+                atr=atr,
+                sl_atr_mult=float(cfg["signals"]["sl_atr_mult"]),
+            )
+            tp = float(price + float(cfg["signals"]["tp_atr_mult"]) * atr)
+
+        ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
+        model_id = meta["model_id"] if meta else "no_model"
+
+        expl = [
+            f"{name}",
+            f"series={ex}:{sym}",
+            f"model={model_id}",
+            f"proba={None if proba is None else round(float(proba),3)}",
+            f"ret_exp={None if ret_exp is None else round(float(ret_exp),4)}",
+            f"ev_bps={None if ev is None else round(float(ev),2)}",
+            f"buy_gate={ok_reason}",
+        ]
+        if m:
+            expl.append(
+                f"robust(n={m.get('n_test')},sh={round(float(m.get('sharpe')),2)},dd={round(float(m.get('max_dd')),2)},hit={round(float(m.get('hit_rate')),2)})"
+            )
+
+        upsert_signal_1d(engine, {
+            "exchange": ex,
+            "symbol": sym,
+            "ts": ts,
+            "action": action,
+            "proba_up": proba,
+            "ret_exp": ret_exp,
+            "risk_est": risk_est,
+            "ev_bps": ev,
+            "size_eur": size_eur,
+            "sl_price": sl,
+            "tp_price": tp,
+            "horizon": f"{horizon_days}d",
+            "explanation": " | ".join(expl),
+            "model_id": model_id,
+            "asset_id": asset_id,
+            "asset_name": asset_name,
+        })
+
+        processed += 1
+        print(f"[SCORE OK] {name} -> {action} ({ex}:{sym}) gate={ok_reason}")
+
+    print(f"SCORE OK: {processed} inst")
 
 
 if __name__ == "__main__":
