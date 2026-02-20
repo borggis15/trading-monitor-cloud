@@ -1,62 +1,101 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
+
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.calibration import CalibratedClassifierCV
+
 
 FEATURES = ["rsi", "ema_fast", "ema_slow", "atr", "zscore"]
 
 
-def train_models(feat: pd.DataFrame, model_type: str, min_rows: int):
+def _prep_xy(feat: pd.DataFrame):
+    df = feat.dropna(subset=FEATURES + ["ret_fwd"]).copy()
+    if df.empty:
+        return None, None, None
+
+    X = df[FEATURES].astype(float)
+    y_up = (df["ret_fwd"].astype(float) > 0).astype(int)
+    y_ret = df["ret_fwd"].astype(float)
+    return df, X, y_up, y_ret
+
+
+def train_models(
+    feat: pd.DataFrame,
+    model_type: str = "hgb",
+    min_rows: int = 200,
+):
     """
     Entrena:
-      - Clasificador: probabilidad de retorno positivo
-      - Regresor: retorno esperado
-    De forma robusta: si no hay datos/columnas suficientes, devuelve (None, None, n_rows)
+      - clasificador (probabilidad subida)
+      - regresor (retorno esperado)
+    + Calibración de probas con holdout time-based (sigmoid) => más realista.
     """
-    # ✅ Guard: feat vacío
-    if feat is None or feat.empty:
+    out = _prep_xy(feat)
+    if out[0] is None:
         return None, None, 0
+    df, X, y_up, y_ret = out
 
-    needed = set(FEATURES + ["ret_fwd"])
-    # ✅ Guard: columnas faltantes
-    if not needed.issubset(set(feat.columns)):
-        return None, None, 0
+    if len(df) < min_rows:
+        return None, None, int(len(df))
 
-    df = feat.dropna(subset=list(needed)).copy()
-    n = len(df)
-    if n < int(min_rows):
-        return None, None, n
+    # split time-based (no shuffle)
+    split = int(len(df) * 0.8)
+    if split < min_rows:
+        split = min_rows
 
-    X = df[FEATURES].values
-    y_cls = (df["ret_fwd"] > 0).astype(int).values
-    y_reg = df["ret_fwd"].values
+    X_tr, X_va = X.iloc[:split], X.iloc[split:]
+    y_tr, y_va = y_up.iloc[:split], y_up.iloc[split:]
+    r_tr, r_va = y_ret.iloc[:split], y_ret.iloc[split:]
 
-    # Modelo robusto (default): HistGradientBoosting
-    clf = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=300)
-    reg = HistGradientBoostingRegressor(max_depth=3, learning_rate=0.05, max_iter=300)
+    clf = HistGradientBoostingClassifier(
+        max_depth=3,
+        learning_rate=0.05,
+        max_iter=300,
+        random_state=42,
+    )
+    reg = HistGradientBoostingRegressor(
+        max_depth=3,
+        learning_rate=0.05,
+        max_iter=300,
+        random_state=42,
+    )
 
-    clf.fit(X, y_cls)
-    reg.fit(X, y_reg)
+    clf.fit(X_tr, y_tr)
+    reg.fit(X_tr, r_tr)
 
-    return clf, reg, n
+    # Calibración SOLO si hay val suficiente
+    clf_cal = clf
+    if len(X_va) >= 50 and y_va.nunique() > 1:
+        clf_cal = CalibratedClassifierCV(clf, method="sigmoid", cv="prefit")
+        clf_cal.fit(X_va, y_va)
+
+    return clf_cal, reg, int(len(df))
 
 
-def predict(clf, reg, feat: pd.DataFrame):
+def predict(clf, reg, feat_latest: pd.DataFrame):
     """
-    Devuelve (proba_subida, retorno_esperado) en el último punto con features válidas.
-    Si no hay datos suficientes, devuelve (None, None).
+    Devuelve:
+      proba_up (float)
+      ret_exp (float)
     """
-    if feat is None or feat.empty:
+    if clf is None or reg is None or feat_latest is None or feat_latest.empty:
         return None, None
 
-    if not set(FEATURES).issubset(set(feat.columns)):
+    df = feat_latest.dropna(subset=FEATURES).copy()
+    if df.empty:
         return None, None
 
-    last = feat.dropna(subset=FEATURES).tail(1)
-    if last.empty:
-        return None, None
+    X = df[FEATURES].astype(float).tail(1)
+    try:
+        proba = float(clf.predict_proba(X)[0, 1])
+    except Exception:
+        proba = None
 
-    X = last[FEATURES].values
-    proba = float(clf.predict_proba(X)[0, 1]) if clf is not None else None
-    ret = float(reg.predict(X)[0]) if reg is not None else None
-    return proba, ret
+    try:
+        ret_exp = float(reg.predict(X)[0])
+    except Exception:
+        ret_exp = None
+
+    return proba, ret_exp
