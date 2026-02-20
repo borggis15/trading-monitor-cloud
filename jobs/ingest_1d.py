@@ -146,10 +146,17 @@ def resolve_daily_series(inst: dict) -> list[tuple[str, str, str]]:
     """
     cands: list[tuple[str, str, str]] = []
 
-    # STOOQ
+    # STOOQ first
     for s in inst.get("stooq_candidates", []) or []:
         if s:
             cands.append(("STOOQ", s, "stooq"))
+
+    # If you ever decide to encode a direct stooq symbol in primary_symbol (optional)
+    # e.g., primary_exchange: "STOOQ" and primary_symbol: "lugc.us"
+    if str(inst.get("primary_exchange", "")).upper() == "STOOQ":
+        ps = inst.get("primary_symbol")
+        if ps:
+            cands.append(("STOOQ", ps, "stooq"))
 
     # YAHOO fallback
     for y in inst.get("yahoo_candidates", []) or []:
