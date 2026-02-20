@@ -8,19 +8,14 @@ from sqlalchemy import text
 from core.config import load_config
 from core.db import get_engine
 
+# ---- VERSION MARKER (para verificar que este archivo es el que se está ejecutando)
+VERSION_MARKER = "INGEST_1D v2 (STOOQ + YAHOO fallback + debug logs)"
+
 # Limita el backfill inicial para no timeoutear
-# (daily: 2500 filas ~ 10 años de cotización si hay 252 sesiones/año)
 INITIAL_MAX_ROWS = 2500
 
 
-# ----------------------------
-# Fetchers
-# ----------------------------
 def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
-    """
-    Stooq daily CSV: https://stooq.com/q/d/l/?s=SYMBOL&i=d
-    symbol examples: pg.us, lly.us, lun.to, etc.
-    """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -44,10 +39,8 @@ def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
 
 
 def fetch_yahoo_daily(ticker: str) -> pd.DataFrame:
-    """
-    Yahoo daily via yfinance. ticker examples: LUN.TO
-    """
-    import yfinance as yf  # noqa: F401
+    # Import aquí dentro para que si no está instalado, lo veamos en el log del WARN
+    import yfinance as yf
 
     df = yf.download(
         tickers=ticker,
@@ -61,17 +54,13 @@ def fetch_yahoo_daily(ticker: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # yfinance devuelve índice DateTimeIndex
     df = df.reset_index()
 
-    # Column names can be: Date, Open, High, Low, Close, Adj Close, Volume
-    # A veces 'Date' o 'Datetime' según versión
     if "Date" in df.columns:
         ts_col = "Date"
     elif "Datetime" in df.columns:
         ts_col = "Datetime"
     else:
-        # fallback: primera columna
         ts_col = df.columns[0]
 
     rename = {}
@@ -101,9 +90,6 @@ def fetch_yahoo_daily(ticker: str) -> pd.DataFrame:
     return df[["ts", "open", "high", "low", "close", "volume"]]
 
 
-# ----------------------------
-# DB helpers
-# ----------------------------
 def get_latest_ts(engine, exchange: str, symbol: str):
     q = """
     select max(ts) as max_ts
@@ -116,15 +102,7 @@ def get_latest_ts(engine, exchange: str, symbol: str):
     return pd.to_datetime(row.loc[0, "max_ts"], utc=True, errors="coerce")
 
 
-def upsert_bars_1d(
-    engine,
-    exchange: str,
-    symbol: str,
-    df: pd.DataFrame,
-    source: str,
-    asset_id: str,
-    asset_name: str,
-) -> int:
+def upsert_bars_1d(engine, exchange: str, symbol: str, df: pd.DataFrame, source: str, asset_id: str, asset_name: str) -> int:
     if df is None or df.empty:
         return 0
 
@@ -135,19 +113,7 @@ def upsert_bars_1d(
     d["asset_id"] = asset_id
     d["asset_name"] = asset_name
 
-    cols = [
-        "exchange",
-        "symbol",
-        "ts",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "source",
-        "asset_id",
-        "asset_name",
-    ]
+    cols = ["exchange","symbol","ts","open","high","low","close","volume","source","asset_id","asset_name"]
 
     with engine.begin() as conn:
         conn.execute(
@@ -172,24 +138,20 @@ def upsert_bars_1d(
     return len(d)
 
 
-# ----------------------------
-# Candidate resolver
-# ----------------------------
 def resolve_daily_series(inst: dict) -> list[tuple[str, str, str]]:
     """
     candidates as (exchange, symbol, source)
-
     Prefer STOOQ for free daily history.
     Fallback to YAHOO (yfinance) when STOOQ not available.
     """
     cands: list[tuple[str, str, str]] = []
 
-    # 1) STOOQ
+    # STOOQ
     for s in inst.get("stooq_candidates", []) or []:
         if s:
             cands.append(("STOOQ", s, "stooq"))
 
-    # 2) YAHOO fallback
+    # YAHOO fallback
     for y in inst.get("yahoo_candidates", []) or []:
         if y:
             cands.append(("YAHOO", y, "yahoo"))
@@ -197,10 +159,9 @@ def resolve_daily_series(inst: dict) -> list[tuple[str, str, str]]:
     return cands
 
 
-# ----------------------------
-# Main
-# ----------------------------
 def main():
+    print(f"[BOOT] {VERSION_MARKER}")
+
     cfg = load_config()
     engine = get_engine()
 
@@ -210,13 +171,17 @@ def main():
         name = inst["name"]
         asset_id = inst.get("isin") or inst.get("asset_id") or name
 
-        print(f"[INGEST_1D] {name}")
+        print(f"\n[INGEST_1D] {name}")
+        cands = resolve_daily_series(inst)
+        print(f"[CANDS] {name}: {cands}")
 
         ok = False
         last_err = None
 
-        for ex, sym, src in resolve_daily_series(inst):
+        for ex, sym, src in cands:
             try:
+                print(f"[TRY] {name}: {ex}:{sym} src={src}")
+
                 if src == "stooq":
                     df = fetch_stooq_daily(sym)
                 elif src == "yahoo":
@@ -225,11 +190,11 @@ def main():
                     df = pd.DataFrame()
 
                 if df is None or df.empty:
+                    print(f"[EMPTY] {name}: {ex}:{sym}")
                     continue
 
                 latest = get_latest_ts(engine, ex, sym)
 
-                # incremental
                 if latest is not None:
                     df_new = df[df["ts"] > latest].copy()
                 else:
@@ -241,15 +206,7 @@ def main():
                     processed += 1
                     break
 
-                n = upsert_bars_1d(
-                    engine,
-                    ex,
-                    sym,
-                    df_new,
-                    source=src,
-                    asset_id=asset_id,
-                    asset_name=name,
-                )
+                n = upsert_bars_1d(engine, ex, sym, df_new, source=src, asset_id=asset_id, asset_name=name)
                 print(f"[OK] {name}: {ex}:{sym} inserted={n} (latest_in_db={latest})")
                 ok = True
                 processed += 1
@@ -257,12 +214,12 @@ def main():
 
             except Exception as e:
                 last_err = e
-                print(f"[WARN] {name} {ex}:{sym} failed: {e}")
+                print(f"[WARN] {name} {ex}:{sym} failed: {repr(e)}")
 
         if not ok:
-            print(f"[SKIP] {name}: no daily data from free sources (last_err={last_err})")
+            print(f"[SKIP] {name}: no daily data from free sources (last_err={repr(last_err)})")
 
-    print(f"INGEST_1D OK: {processed} assets")
+    print(f"\nINGEST_1D OK: {processed} assets")
 
 
 if __name__ == "__main__":
