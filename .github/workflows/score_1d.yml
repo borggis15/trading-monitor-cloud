@@ -1,0 +1,23 @@
+name: score_1d
+on:
+  schedule:
+    - cron: "20 7 * * *"   # todos los días 07:20 UTC (ajústalo si quieres)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Score 1D (unbuffered)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: python -u -m jobs.score_1d
