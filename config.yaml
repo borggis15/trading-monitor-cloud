@@ -62,6 +62,7 @@ ml:
   horizon_bars: 10
   model_type: hgb
   min_train_rows: 200
+  horizon_days_1d: 10
 
 backtest:
   fee_bps: 1.0
