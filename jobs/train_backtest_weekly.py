@@ -37,27 +37,18 @@ def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
 
 def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
     candidates = []
-
-    # XETR primero
     candidates.append(("XETR", inst["xetra_symbol"]))
-
-    # STOOQ candidates
     for c in inst.get("stooq_candidates", []) or []:
         candidates.append(("STOOQ", c))
-
-    # ✅ YAHOO candidates (nuevo)
     for y in inst.get("yahoo_candidates", []) or []:
         candidates.append(("YAHOO", y))
-
-    # PRIMARY último
     candidates.append(("PRIMARY", inst["primary_symbol"]))
 
     for ex, sym in candidates:
         bars = read_bars(engine, ex, sym)
         if bars is not None and not bars.empty:
-            print(f"[SERIES] {inst['name']} usando {ex}:{sym} bars={len(bars)}")
+            print(f"[SERIES] {inst['name']} using {ex}:{sym} bars={len(bars)}")
             return ex, sym
-
     return None, None
 
 
@@ -67,7 +58,14 @@ def compute_walk_forward_metrics(
     fee_bps: float,
     slippage_bps: float,
     max_oos_points: int = 160,
+    retrain_every: int = 10,
+    rolling_train_window: int = 2500,
 ):
+    """
+    More stable walk-forward:
+    - retrain every N steps instead of every step
+    - use rolling window for train to reduce regime drift + speed up
+    """
     df = feat.copy()
     need = FEATURES + ["ret_fwd"]
     if df is None or df.empty or any(c not in df.columns for c in need):
@@ -78,11 +76,12 @@ def compute_walk_forward_metrics(
             "sharpe": None,
             "max_dd": None,
             "profit_factor": None,
-            "notes": "Faltan columnas o feat vacío",
+            "trade_freq": None,
+            "notes": "missing_columns_or_empty",
         }
 
     df = df.dropna(subset=need).copy()
-    if len(df) < (min_train + 20):
+    if len(df) < (min_train + 50):
         return {
             "n_test": 0,
             "hit_rate": None,
@@ -90,11 +89,13 @@ def compute_walk_forward_metrics(
             "sharpe": None,
             "max_dd": None,
             "profit_factor": None,
-            "notes": f"Insuficientes filas tras dropna: {len(df)}",
+            "trade_freq": None,
+            "notes": f"too_few_rows_after_dropna={len(df)}",
         }
 
     start = min_train
     end = len(df) - 1
+
     if (end - start) > max_oos_points:
         start = end - max_oos_points
 
@@ -102,43 +103,57 @@ def compute_walk_forward_metrics(
     hits = 0
     pos_count = 0
     in_pos = False
+    trades = 0
 
-    for i in range(start, end):
-        train = df.iloc[:i].copy()
+    clf = reg = None
+
+    for step_i, i in enumerate(range(start, end)):
+        # Train slice (rolling)
+        train_end = i
+        train_start = max(0, train_end - rolling_train_window)
+        train = df.iloc[train_start:train_end].copy()
         test = df.iloc[i : i + 1].copy()
+
         if len(train) < min_train or test.empty:
             continue
 
-        clf, reg, _ = train_models(train, model_type="hgb", min_rows=min_train)
+        # retrain cadence
+        if clf is None or reg is None or (step_i % retrain_every == 0):
+            clf, reg, _ = train_models(train, model_type="hgb", min_rows=min_train)
+
         proba, ret_exp = predict(clf, reg, test)
 
         atr = float(test["atr"].iloc[0]) if np.isfinite(test["atr"].iloc[0]) else None
         risk_est = 0.02 if atr else None
-
         ev = ev_bps(ret_exp, risk_est, fee_bps, slippage_bps)
 
         signal = "HOLD"
         if proba is not None and ret_exp is not None and ev is not None:
-            if proba > 0.60 and ev > 2.0:
+            if proba >= 0.62 and ev >= 5.0:
                 signal = "BUY"
-            elif proba < 0.45 and ev < -2.0:
+            elif proba <= 0.40 and ev <= -5.0:
                 signal = "SELL"
 
+        prev_in_pos = in_pos
         if signal == "BUY":
             in_pos = True
         elif signal == "SELL":
             in_pos = False
 
+        if (not prev_in_pos) and in_pos:
+            trades += 1
+
         r = float(test["ret_fwd"].iloc[0])
         strat_r = r if in_pos else 0.0
 
         realized.append(strat_r)
+
         if strat_r != 0.0:
             pos_count += 1
             if strat_r > 0:
                 hits += 1
 
-    if len(realized) < 20:
+    if len(realized) < 30:
         return {
             "n_test": int(len(realized)),
             "hit_rate": None,
@@ -146,7 +161,8 @@ def compute_walk_forward_metrics(
             "sharpe": None,
             "max_dd": None,
             "profit_factor": None,
-            "notes": f"Pocas muestras OOS: {len(realized)}",
+            "trade_freq": None,
+            "notes": f"too_few_oos_samples={len(realized)}",
         }
 
     rets = np.array(realized, dtype=float)
@@ -164,6 +180,11 @@ def compute_walk_forward_metrics(
     pf = float(gains / losses) if losses > 0 else None
 
     hit_rate = float(hits / pos_count) if pos_count > 0 else None
+    trade_freq = float(trades / max(1, len(rets)))  # per OOS step
+
+    notes = ""
+    if trades == 0:
+        notes = "no_trades_generated"
 
     return {
         "n_test": int(len(rets)),
@@ -172,7 +193,8 @@ def compute_walk_forward_metrics(
         "sharpe": sharpe,
         "max_dd": max_dd,
         "profit_factor": pf,
-        "notes": "",
+        "trade_freq": trade_freq,
+        "notes": notes,
     }
 
 
@@ -225,19 +247,22 @@ def main():
         name = inst["name"]
         ex, sym = resolve_series(engine, inst)
         if not ex or not sym:
-            print(f"[TRAIN SKIP] {name}: sin datos")
+            print(f"[TRAIN SKIP] {name}: no data")
             continue
 
         bars = read_bars(engine, ex, sym)
+
+        # Keep a reasonable max window to control memory/time (still uses last bars)
+        bars = bars.tail(5000)
+
         feat = compute_features(bars, horizon_bars=horizon)
         if feat is None or feat.empty:
-            print(f"[TRAIN SKIP] {name}: features vacío")
+            print(f"[TRAIN SKIP] {name}: empty features")
             continue
 
         clf, reg, train_rows = train_models(feat, model_type=model_type, min_rows=min_rows)
         model_id = f"{model_type}_{horizon}d"
         meta = {"name": name, "train_rows": int(train_rows), "horizon_days": int(horizon)}
-
         save_models(engine, ex, sym, model_id, clf, reg, meta)
 
         trained_at = datetime.now(timezone.utc)
@@ -248,12 +273,17 @@ def main():
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             max_oos_points=160,
+            retrain_every=10,
+            rolling_train_window=2500,
         )
 
         insert_metrics(engine, ex, sym, model_id, trained_at, f"{horizon}d", m)
         inserted += 1
 
-        print(f"[METRICS OK] {name} {ex}:{sym} n_test={m.get('n_test')} sharpe={m.get('sharpe')} notes={m.get('notes')}")
+        print(
+            f"[METRICS OK] {name} {ex}:{sym} n_test={m.get('n_test')} sharpe={m.get('sharpe')} "
+            f"max_dd={m.get('max_dd')} hit_rate={m.get('hit_rate')} notes={m.get('notes')}"
+        )
 
     with engine.begin() as conn:
         c = conn.execute(text("select count(*) from public.model_metrics")).scalar()
