@@ -3,7 +3,6 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import ProgrammingError, OperationalError
 
 st.set_page_config(page_title="Trading Monitor Pro", layout="wide")
 
@@ -59,7 +58,7 @@ def trend_from_ret(ret_exp):
 
 def confidence_score(proba_up, sharpe, n_test):
     """
-    Score orientativo 0-100 para UI.
+    Score orientativo 0-100 para UI (resumen, no “garantía”).
     """
     p = num(proba_up)
     sh = num(sharpe)
@@ -78,21 +77,6 @@ def confidence_score(proba_up, sharpe, n_test):
 
     return round(min(100.0, base + sh_bonus + nt_bonus), 0)
 
-def horizon_days_from_row(row, default_h=10):
-    h = row.get("horizon", None)
-    if h is None:
-        return default_h
-    # si viene como "10d"
-    if isinstance(h, str) and h.endswith("d"):
-        try:
-            return int(h.replace("d", ""))
-        except Exception:
-            return default_h
-    hv = num(h)
-    if hv is not None and hv > 0:
-        return int(hv)
-    return default_h
-
 def expected_pnl_eur(size_eur, ret_exp):
     s = num(size_eur)
     r = num(ret_exp)
@@ -100,34 +84,60 @@ def expected_pnl_eur(size_eur, ret_exp):
         return None
     return s * r
 
-# ----------------------------
-# Timeframe mapping
-# ----------------------------
-def tf_tables(tf: str):
-    tf = (tf or "15m").lower()
+def get_tf_meta(tf: str):
+    """
+    tf: "15m" o "1d"
+    """
+    tf = (tf or "").lower()
+    if tf not in ("15m", "1d"):
+        tf = "15m"
+
     if tf == "1d":
         return {
-            "signals_current": "public.signals_1d_current_by_asset",
-            "signals_table": "public.signals_1d",
+            "tf": "1d",
+            "signals_view": "public.signals_1d_current_by_asset",
             "bars_table": "public.bars_1d",
-            # si existe en tu DB, la usará; si no existe, hará fallback
-            "metrics_latest_view": "public.model_metrics_1d_latest",
+            "signals_table": "public.signals",
+            "metrics_filter_sql": "and model_id like '%\\_1d' escape '\\'",
+            "signals_filter_sql": "and model_id like '%\\_1d' escape '\\'",
             "default_horizon_days": 10,
+            "bars_limit": 3000,
+            "hist_limit": 500,
         }
+
     return {
-        "signals_current": "public.signals_current_by_asset",
-        "signals_table": "public.signals",
+        "tf": "15m",
+        "signals_view": "public.signals_current_by_asset",
         "bars_table": "public.bars_15m",
-        "metrics_latest_view": "public.model_metrics_latest",
+        "signals_table": "public.signals",
+        "metrics_filter_sql": "and model_id not like '%\\_1d' escape '\\'",
+        "signals_filter_sql": "and model_id not like '%\\_1d' escape '\\'",
         "default_horizon_days": 10,
+        "bars_limit": 900,
+        "hist_limit": 400,
     }
+
+def horizon_days_from_row(row, default_h=10):
+    h = row.get("horizon", None)
+    if h is None:
+        return int(default_h)
+    # horizon suele ser texto tipo "10d"
+    if isinstance(h, str) and h.endswith("d"):
+        try:
+            return int(h[:-1])
+        except Exception:
+            return int(default_h)
+    hv = num(h)
+    if hv is not None and hv > 0:
+        return int(hv)
+    return int(default_h)
 
 # ----------------------------
 # Loaders
 # ----------------------------
 @st.cache_data(ttl=60)
 def load_signals_current(tf: str):
-    t = tf_tables(tf)
+    meta = get_tf_meta(tf)
     q = f"""
     select
       asset_name, asset_id,
@@ -137,7 +147,7 @@ def load_signals_current(tf: str):
       risk_est,
       size_eur, sl_price, tp_price,
       horizon, explanation, model_id
-    from {t["signals_current"]}
+    from {meta['signals_view']}
     order by asset_name;
     """
     df = pd.read_sql(text(q), engine)
@@ -148,38 +158,16 @@ def load_signals_current(tf: str):
 @st.cache_data(ttl=120)
 def load_latest_metrics(tf: str):
     """
-    15m: intenta view model_metrics_latest si existe, si no fallback.
-    1d: intenta view model_metrics_1d_latest si existe, si no fallback.
-    Fallback: coge latest general de public.model_metrics (sin filtrar por model_id).
+    Trae la última métrica por (exchange, symbol) filtrando por timeframe.
     """
-    t = tf_tables(tf)
-
-    # 1) Intento: vista específica (si existe)
-    q_view = f"""
-    select
-      exchange, symbol,
-      metrics_model_id, trained_at,
-      sharpe, max_dd, hit_rate, profit_factor, n_test, notes
-    from {t["metrics_latest_view"]}
-    """
-    try:
-        df = pd.read_sql(text(q_view), engine)
-        if not df.empty:
-            df["trained_at"] = to_dt_utc(df["trained_at"])
-            return df
-    except (ProgrammingError, OperationalError):
-        # vista no existe o no accesible → fallback
-        pass
-    except Exception:
-        # cualquier otro error → fallback
-        pass
-
-    # 2) Fallback: latest general por (exchange, symbol)
-    q_fallback = """
+    meta = get_tf_meta(tf)
+    q = f"""
     with ranked as (
       select *,
         row_number() over (partition by exchange, symbol order by trained_at desc) as rn
       from public.model_metrics
+      where 1=1
+      {meta['metrics_filter_sql']}
     )
     select
       exchange, symbol,
@@ -189,26 +177,22 @@ def load_latest_metrics(tf: str):
     from ranked
     where rn=1
     """
-    df2 = pd.read_sql(text(q_fallback), engine)
-    if not df2.empty:
-        df2["trained_at"] = to_dt_utc(df2["trained_at"])
-    return df2
+    df = pd.read_sql(text(q), engine)
+    if not df.empty:
+        df["trained_at"] = to_dt_utc(df["trained_at"])
+    return df
 
 @st.cache_data(ttl=60)
-def load_bars(tf: str, exchange: str, symbol: str, limit=900):
-    t = tf_tables(tf)
+def load_bars(tf: str, exchange: str, symbol: str, limit: int):
+    meta = get_tf_meta(tf)
     q = f"""
     select ts, open, high, low, close, volume
-    from {t["bars_table"]}
+    from {meta['bars_table']}
     where exchange=:exchange and symbol=:symbol
     order by ts desc
     limit :limit
     """
-    df = pd.read_sql(
-        text(q),
-        engine,
-        params={"exchange": exchange, "symbol": symbol, "limit": int(limit)}
-    )
+    df = pd.read_sql(text(q), engine, params={"exchange": exchange, "symbol": symbol, "limit": int(limit)})
     if df.empty:
         return df
     df["ts"] = to_dt_utc(df["ts"])
@@ -216,39 +200,32 @@ def load_bars(tf: str, exchange: str, symbol: str, limit=900):
     return df
 
 @st.cache_data(ttl=60)
-def load_signal_history(tf: str, exchange: str, symbol: str, limit=250):
-    t = tf_tables(tf)
+def load_signal_history(tf: str, exchange: str, symbol: str, limit: int):
+    meta = get_tf_meta(tf)
     q = f"""
     select ts, action, ev_bps, proba_up, ret_exp, risk_est, size_eur, sl_price, tp_price, model_id
-    from {t["signals_table"]}
+    from {meta['signals_table']}
     where exchange=:exchange and symbol=:symbol
+      {meta['signals_filter_sql']}
     order by ts desc
     limit :limit
     """
-    df = pd.read_sql(
-        text(q),
-        engine,
-        params={"exchange": exchange, "symbol": symbol, "limit": int(limit)}
-    )
+    df = pd.read_sql(text(q), engine, params={"exchange": exchange, "symbol": symbol, "limit": int(limit)})
     if df.empty:
         return df
     df["ts"] = to_dt_utc(df["ts"])
     df = df.dropna(subset=["ts"]).sort_values("ts")
     return df
-
-# ----------------------------
-# Header
-# ----------------------------
-st.title("Trading Monitor Pro")
 
 # ----------------------------
 # Sidebar
 # ----------------------------
+st.title("Trading Monitor Pro")
+
 with st.sidebar:
     st.subheader("Controls")
 
-    # Selector timeframe
-    tf = st.radio("Timeframe", ["15m", "1d"], index=0, horizontal=True)
+    tf = st.selectbox("Timeframe", ["15m", "1d"], index=0)
 
     if st.button("Refresh", use_container_width=True):
         st.cache_data.clear()
@@ -276,6 +253,8 @@ with st.sidebar:
     st.subheader("Ranking")
     sort_by = st.selectbox("Sort by", ["EV (bps)", "Confidence", "Sharpe", "Hit rate", "Max DD", "n_test"], index=0)
 
+meta = get_tf_meta(tf)
+
 # ----------------------------
 # Load & merge
 # ----------------------------
@@ -283,7 +262,7 @@ signals = load_signals_current(tf)
 metrics = load_latest_metrics(tf)
 
 if signals.empty:
-    st.warning(f"No current signals for {tf}. Run the corresponding score workflow.")
+    st.warning(f"No current signals for {tf}. Run the corresponding score job.")
     st.stop()
 
 df = signals.merge(metrics, on=["exchange", "symbol"], how="left")
@@ -294,10 +273,7 @@ for c in ["ev_bps", "proba_up", "ret_exp", "risk_est", "size_eur", "sl_price", "
     if c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-df["confidence"] = df.apply(
-    lambda r: confidence_score(r.get("proba_up"), r.get("sharpe"), r.get("n_test")),
-    axis=1
-)
+df["confidence"] = df.apply(lambda r: confidence_score(r.get("proba_up"), r.get("sharpe"), r.get("n_test")), axis=1)
 
 # Filters
 df_view = df[df["action"].isin(actions_filter)].copy()
@@ -354,7 +330,6 @@ st.subheader(f"Current signals ({tf})")
 
 cols = st.columns(3)
 cards = df_rank.sort_values("asset_name").to_dict(orient="records")
-default_h = tf_tables(tf)["default_horizon_days"]
 
 for i, r in enumerate(cards):
     with cols[i % 3]:
@@ -363,7 +338,8 @@ for i, r in enumerate(cards):
             ex = r.get("exchange") or "—"
             sym = r.get("symbol") or "—"
             action_txt, color = action_style(r.get("action"))
-            h_days = horizon_days_from_row(r, default_h=default_h)
+
+            h_days = horizon_days_from_row(r, default_h=meta["default_horizon_days"])
             ts = r.get("ts")
             entry_ts = ts if pd.notna(ts) else None
             exit_ts = (entry_ts + pd.Timedelta(days=h_days)) if entry_ts is not None else None
@@ -394,7 +370,7 @@ for i, r in enumerate(cards):
             with c4:
                 st.metric("Exp. return", fmt_pct(r.get("ret_exp"), 2))
             with c5:
-                st.metric("Risk est.", fmt(r.get("risk_est"), 4))
+                st.metric("Suggested size (€)", fmt(size_eur, 0))
             with c6:
                 st.metric("Exp. P&L (€)", fmt(pnl_eur, 0))
 
@@ -407,13 +383,13 @@ for i, r in enumerate(cards):
 
             tlabel = trend_from_ret(r.get("ret_exp"))
             if action_txt == "BUY":
-                st.write(f"Bias: {tlabel}. Enter within the window; exit on SELL or at target date.")
+                st.write(f"Trend: {tlabel}. Plan: enter within the window; exit on SELL signal or at target date.")
                 if pd.notna(r.get("sl_price")) or pd.notna(r.get("tp_price")):
-                    st.caption(f"Levels: SL {fmt(r.get('sl_price'),2)} · TP {fmt(r.get('tp_price'),2)}")
+                    st.caption(f"Risk levels: SL {fmt(r.get('sl_price'),2)} · TP {fmt(r.get('tp_price'),2)}")
             elif action_txt == "SELL":
-                st.write(f"Bias: {tlabel}. Avoid new entries; if holding, reduce/exit on next liquidity window.")
+                st.write(f"Trend: {tlabel}. Plan: avoid new entries; if holding, reduce/exit on next liquidity window.")
             else:
-                st.write(f"Bias: {tlabel}. Wait; reassess on next update.")
+                st.write(f"Trend: {tlabel}. Plan: wait; reassess on next update or if confidence increases.")
 
             with st.expander("Technical details"):
                 st.code((r.get("explanation") or "").strip(), language="text")
@@ -421,7 +397,7 @@ for i, r in enumerate(cards):
 st.divider()
 
 # ----------------------------
-# Ranking
+# Ranking table
 # ----------------------------
 st.subheader("Ranking")
 
@@ -449,10 +425,10 @@ sel = st.selectbox("Select an asset", options=names, index=0)
 row = df[df["asset_name"] == sel].iloc[0]
 ex = row["exchange"]
 sym = row["symbol"]
-h_days = horizon_days_from_row(row, default_h=default_h)
+h_days = horizon_days_from_row(row, default_h=meta["default_horizon_days"])
 
-bars = load_bars(tf, ex, sym, limit=900)
-hist = load_signal_history(tf, ex, sym, limit=250)
+bars = load_bars(tf, ex, sym, limit=meta["bars_limit"])
+hist = load_signal_history(tf, ex, sym, limit=meta["hist_limit"])
 
 if bars.empty:
     st.warning("No bars available for this asset.")
@@ -494,6 +470,7 @@ with left:
         f"{action_txt}</div>",
         unsafe_allow_html=True
     )
+
     st.write("")
     st.write(f"EV: {fmt(row.get('ev_bps'),1)} bps ({bps_to_pct_str(row.get('ev_bps'))})")
     st.write(f"Expected return: {fmt_pct(row.get('ret_exp'),2)} ({trend_from_ret(row.get('ret_exp'))})")
