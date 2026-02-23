@@ -29,7 +29,6 @@ def save_models(
     """
     Guarda modelos en Postgres como pickles + meta JSONB.
     Compatible SQLAlchemy 2.x.
-    IMPORTANTE: usamos CAST(:meta AS jsonb) para evitar el bug de :meta::jsonb.
     """
     table = _table_for_tf(tf)
 
@@ -86,7 +85,6 @@ def load_latest_models(
 ) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
     """
     Carga el último (clf, reg, meta) por trained_at desc.
-    Devuelve (None, None, None) si no hay modelo.
     """
     table = _table_for_tf(tf)
 
@@ -99,16 +97,28 @@ def load_latest_models(
     """
 
     with engine.connect() as conn:
-        res = conn.execute(text(q), {"exchange": exchange, "symbol": symbol})
-        row = res.mappings().first()  # acceso por claves (evita tuple index)
+        result = conn.execute(
+            text(q),
+            {"exchange": exchange, "symbol": symbol}
+        )
+        row = result.mappings().first()
 
     if not row:
         return None, None, None
 
-    clf = pickle.loads(row["clf_pickle"]) if row.get("clf_pickle") is not None else None
-    reg = pickle.loads(row["reg_pickle"]) if row.get("reg_pickle") is not None else None
+    # 🔒 robust deserialization
+    try:
+        clf = pickle.loads(row["clf_pickle"]) if row.get("clf_pickle") else None
+    except Exception:
+        clf = None
+
+    try:
+        reg = pickle.loads(row["reg_pickle"]) if row.get("reg_pickle") else None
+    except Exception:
+        reg = None
 
     meta_val = row.get("meta")
+
     if meta_val is None:
         meta_dict: Dict[str, Any] = {}
     elif isinstance(meta_val, dict):
@@ -120,4 +130,6 @@ def load_latest_models(
             meta_dict = {"raw_meta": str(meta_val)}
 
     meta_dict.setdefault("model_id", row.get("model_id"))
+    meta_dict.setdefault("trained_at", str(row.get("trained_at")))
+
     return clf, reg, meta_dict
