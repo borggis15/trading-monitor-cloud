@@ -1,135 +1,183 @@
 from __future__ import annotations
 
-import json
-import pickle
+import numpy as np
+import pandas as pd
+
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from sqlalchemy import text
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 
-def _table_for_tf(tf: str | None) -> str:
+FEATURES_DEFAULT = ["rsi", "ema_fast", "ema_slow", "atr", "zscore"]
+
+
+@dataclass
+class Thresholds:
+    buy_proba: float
+    sell_proba: float
+    buy_ev_bps: float
+    sell_ev_bps: float
+
+
+def _prep_xy(df: pd.DataFrame, features: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    tf=None or '15m' -> model_store
-    tf='1d' -> model_store_1d
+    y_cls: 1 si ret_fwd > 0, 0 si <= 0
+    y_reg: ret_fwd (float)
     """
-    tf = (tf or "").strip().lower()
-    return "public.model_store_1d" if tf == "1d" else "public.model_store"
+    need = list(features) + ["ret_fwd"]
+    d = df.dropna(subset=need).copy()
+    X = d[features].to_numpy(dtype=float)
+    y_reg = d["ret_fwd"].to_numpy(dtype=float)
+    y_cls = (y_reg > 0).astype(int)
+    return X, y_cls, y_reg
 
 
-def save_models(
-    engine,
-    exchange: str,
-    symbol: str,
-    model_id: str,
-    clf,
-    reg,
-    meta: Dict[str, Any] | None = None,
-    tf: str | None = None,
-) -> None:
+def _compute_thresholds_from_train(
+    clf_cal: Any,
+    reg: Any,
+    X_train: np.ndarray,
+    fee_bps: float,
+    slippage_bps: float,
+) -> Thresholds:
     """
-    Guarda modelos en Postgres como pickles + meta JSONB.
-    Compatible SQLAlchemy 2.x.
+    Thresholds dinámicos (por activo) aprendidos del train:
+    - buy_proba: cuantil 70% de proba
+    - sell_proba: cuantil 30% de proba
+    - buy_ev_bps: cuantil 60% de EV estimada
+    - sell_ev_bps: cuantil 40% de EV estimada
     """
-    table = _table_for_tf(tf)
+    proba = clf_cal.predict_proba(X_train)[:, 1]
+    ret_exp = reg.predict(X_train)
 
-    meta = meta or {}
-    meta_json = json.dumps(meta, ensure_ascii=False)
+    ev_bps = (ret_exp * 10000.0) - (fee_bps + slippage_bps)
 
-    clf_blob = pickle.dumps(clf) if clf is not None else None
-    reg_blob = pickle.dumps(reg) if reg is not None else None
+    buy_p = float(np.quantile(proba, 0.70))
+    sell_p = float(np.quantile(proba, 0.30))
+    buy_ev = float(np.quantile(ev_bps, 0.60))
+    sell_ev = float(np.quantile(ev_bps, 0.40))
 
-    q = f"""
-    insert into {table}(
-        exchange,
-        symbol,
-        model_id,
-        trained_at,
-        clf_pickle,
-        reg_pickle,
-        meta
+    # clamps razonables
+    buy_p = float(np.clip(buy_p, 0.55, 0.75))
+    sell_p = float(np.clip(sell_p, 0.25, 0.48))
+
+    # mínimos para evitar BUY/SELL por ruido
+    buy_ev = max(buy_ev, 25.0)
+    sell_ev = min(sell_ev, -25.0)
+
+    return Thresholds(buy_proba=buy_p, sell_proba=sell_p, buy_ev_bps=buy_ev, sell_ev_bps=sell_ev)
+
+
+def train_models(
+    feat: pd.DataFrame,
+    model_type: str = "hgb",
+    min_rows: int = 240,
+    features: Optional[list[str]] = None,
+    fee_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> Tuple[Any, Any, int, Dict[str, Any]]:
+    """
+    Devuelve: (clf_calibrado, reg, train_rows, meta)
+
+    meta incluye thresholds dinámicos:
+      meta["thresholds"] = {buy_proba, sell_proba, buy_ev_bps, sell_ev_bps}
+    """
+    features = features or FEATURES_DEFAULT
+
+    X, y_cls, y_reg = _prep_xy(feat, features)
+    n = int(len(X))
+    if n < int(min_rows):
+        raise ValueError(f"Not enough rows to train: {n} < min_rows={min_rows}")
+
+    # Modelos base
+    clf_base = HistGradientBoostingClassifier(
+        max_depth=3,
+        learning_rate=0.06,
+        max_iter=250,
+        early_stopping=True,
+        validation_fraction=0.15,
+        random_state=42,
     )
-    values (
-        :exchange,
-        :symbol,
-        :model_id,
-        now(),
-        :clf_pickle,
-        :reg_pickle,
-        CAST(:meta AS jsonb)
-    )
-    on conflict (exchange, symbol, model_id) do update set
-        trained_at = excluded.trained_at,
-        clf_pickle = excluded.clf_pickle,
-        reg_pickle = excluded.reg_pickle,
-        meta = excluded.meta
-    """
 
-    params = {
-        "exchange": exchange,
-        "symbol": symbol,
-        "model_id": model_id,
-        "clf_pickle": clf_blob,
-        "reg_pickle": reg_blob,
-        "meta": meta_json,
+    reg = HistGradientBoostingRegressor(
+        max_depth=3,
+        learning_rate=0.06,
+        max_iter=250,
+        early_stopping=True,
+        validation_fraction=0.15,
+        random_state=42,
+    )
+
+    # Fit base clf
+    clf_base.fit(X, y_cls)
+
+    # Calibración sin leakage (TimeSeriesSplit)
+    tscv = TimeSeriesSplit(n_splits=3)
+    clf_cal = CalibratedClassifierCV(
+        estimator=clf_base,
+        method="sigmoid",
+        cv=tscv,
+    )
+    clf_cal.fit(X, y_cls)
+
+    # Fit reg
+    reg.fit(X, y_reg)
+
+    thr = _compute_thresholds_from_train(
+        clf_cal,
+        reg,
+        X_train=X,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+
+    meta: Dict[str, Any] = {
+        "features": features,
+        "thresholds": {
+            "buy_proba": thr.buy_proba,
+            "sell_proba": thr.sell_proba,
+            "buy_ev_bps": thr.buy_ev_bps,
+            "sell_ev_bps": thr.sell_ev_bps,
+        },
+        "calibration": {"method": "sigmoid", "cv": "TimeSeriesSplit(3)"},
     }
 
-    with engine.begin() as conn:
-        conn.execute(text(q), params)
+    return clf_cal, reg, n, meta
 
 
-def load_latest_models(
-    engine,
-    exchange: str,
-    symbol: str,
-    tf: str | None = None,
-) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
+def predict(
+    clf,
+    reg,
+    feat: pd.DataFrame,
+    features: Optional[list[str]] = None,
+) -> tuple[Optional[float], Optional[float]]:
     """
-    Carga el último (clf, reg, meta) por trained_at desc.
+    Predice sobre la última fila válida de feat.
+    Devuelve: (proba_up, ret_exp)
     """
-    table = _table_for_tf(tf)
+    if feat is None or feat.empty:
+        return None, None
 
-    q = f"""
-    select model_id, trained_at, clf_pickle, reg_pickle, meta
-    from {table}
-    where exchange=:exchange and symbol=:symbol
-    order by trained_at desc
-    limit 1
-    """
+    features = features or FEATURES_DEFAULT
+    d = feat.dropna(subset=features).tail(1)
+    if d.empty:
+        return None, None
 
-    with engine.connect() as conn:
-        result = conn.execute(
-            text(q),
-            {"exchange": exchange, "symbol": symbol}
-        )
-        row = result.mappings().first()
+    X = d[features].to_numpy(dtype=float)
 
-    if not row:
-        return None, None, None
-
-    # 🔒 robust deserialization
-    try:
-        clf = pickle.loads(row["clf_pickle"]) if row.get("clf_pickle") else None
-    except Exception:
-        clf = None
+    proba = None
+    ret_exp = None
 
     try:
-        reg = pickle.loads(row["reg_pickle"]) if row.get("reg_pickle") else None
+        proba = float(clf.predict_proba(X)[0, 1])
     except Exception:
-        reg = None
+        proba = None
 
-    meta_val = row.get("meta")
+    try:
+        ret_exp = float(reg.predict(X)[0])
+    except Exception:
+        ret_exp = None
 
-    if meta_val is None:
-        meta_dict: Dict[str, Any] = {}
-    elif isinstance(meta_val, dict):
-        meta_dict = meta_val
-    else:
-        try:
-            meta_dict = json.loads(meta_val)
-        except Exception:
-            meta_dict = {"raw_meta": str(meta_val)}
-
-    meta_dict.setdefault("model_id", row.get("model_id"))
-    meta_dict.setdefault("trained_at", str(row.get("trained_at")))
-
-    return clf, reg, meta_dict
+    return proba, ret_exp
