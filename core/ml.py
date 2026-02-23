@@ -1,138 +1,135 @@
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+import json
+import pickle
+from typing import Any, Dict, Optional, Tuple
 
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
-from sklearn.calibration import CalibratedClassifierCV
-
-
-FEATURES = ["rsi", "ema_fast", "ema_slow", "atr", "zscore"]
+from sqlalchemy import text
 
 
-def _prep_xy(df: pd.DataFrame):
+def _table_for_tf(tf: str | None) -> str:
     """
-    Prepara X, y_cls, y_reg desde un DataFrame de features.
-    Requiere: FEATURES y 'ret_fwd' en df.
+    tf=None or '15m' -> model_store
+    tf='1d' -> model_store_1d
     """
-    need = FEATURES + ["ret_fwd"]
-    if df is None or df.empty or any(c not in df.columns for c in need):
-        return None, None, None
-
-    d = df.dropna(subset=need).copy()
-    if d.empty:
-        return None, None, None
-
-    X = d[FEATURES].astype(float)
-
-    # Clasificación: "sube" si ret_fwd > 0
-    y_cls = (d["ret_fwd"].astype(float) > 0.0).astype(int)
-
-    # Regresión: retorno esperado
-    y_reg = d["ret_fwd"].astype(float)
-
-    return X, y_cls, y_reg
+    tf = (tf or "").strip().lower()
+    return "public.model_store_1d" if tf == "1d" else "public.model_store"
 
 
-def train_models(
-    feat: pd.DataFrame,
-    model_type: str = "hgb",
-    min_rows: int = 200,
-    calibrate: bool = True,
-    cal_cv: int = 3,
-):
+def save_models(
+    engine,
+    exchange: str,
+    symbol: str,
+    model_id: str,
+    clf,
+    reg,
+    meta: Dict[str, Any] | None = None,
+    tf: str | None = None,
+) -> None:
     """
-    Entrena:
-      - clf: clasificador prob(up)
-      - reg: regresor retorno esperado
-
-    NOTA sobre calibración:
-    - scikit-learn reciente ya NO permite cv="prefit".
-    - Usamos CalibratedClassifierCV con CV interno (cal_cv=3 por defecto).
+    Guarda modelos en Postgres como pickles + meta JSONB.
+    Compatible SQLAlchemy 2.x.
     """
-    X, y_cls, y_reg = _prep_xy(feat)
-    if X is None:
-        return None, None, 0
+    table = _table_for_tf(tf)
 
-    n = len(X)
-    if n < min_rows:
-        # no entrenamos si no hay histórico suficiente
-        return None, None, int(n)
+    meta = meta or {}
+    meta_json = json.dumps(meta, ensure_ascii=False)
 
-    if model_type != "hgb":
-        raise ValueError(f"Unsupported model_type={model_type}. Use 'hgb'.")
+    clf_blob = pickle.dumps(clf) if clf is not None else None
+    reg_blob = pickle.dumps(reg) if reg is not None else None
 
-    # Base models
-    base_clf = HistGradientBoostingClassifier(
-        max_depth=3,
-        learning_rate=0.07,
-        max_iter=300,
-        random_state=42,
+    q = f"""
+    insert into {table}(
+        exchange,
+        symbol,
+        model_id,
+        trained_at,
+        clf_pickle,
+        reg_pickle,
+        meta
     )
-
-    reg = HistGradientBoostingRegressor(
-        max_depth=3,
-        learning_rate=0.07,
-        max_iter=300,
-        random_state=42,
+    values (
+        :exchange,
+        :symbol,
+        :model_id,
+        now(),
+        :clf_pickle,
+        :reg_pickle,
+        CAST(:meta AS jsonb)
     )
+    on conflict (exchange, symbol, model_id) do update set
+        trained_at = excluded.trained_at,
+        clf_pickle = excluded.clf_pickle,
+        reg_pickle = excluded.reg_pickle,
+        meta = excluded.meta
+    """
 
-    # Entrenamos regresor
-    reg.fit(X, y_reg)
+    params = {
+        "exchange": exchange,
+        "symbol": symbol,
+        "model_id": model_id,
+        "clf_pickle": clf_blob,
+        "reg_pickle": reg_blob,
+        "meta": meta_json,
+    }
 
-    # Entrenamos clasificador (con calibración opcional)
-    if calibrate:
-        # ✅ Calibración robusta y compatible con sklearn moderno:
-        # CalibratedClassifierCV entrena internamente con CV.
-        clf = CalibratedClassifierCV(
-            estimator=base_clf,
-            method="sigmoid",
-            cv=int(cal_cv),
+    with engine.begin() as conn:
+        conn.execute(text(q), params)
+
+
+def load_latest_models(
+    engine,
+    exchange: str,
+    symbol: str,
+    tf: str | None = None,
+) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
+    """
+    Carga el último (clf, reg, meta) por trained_at desc.
+    """
+    table = _table_for_tf(tf)
+
+    q = f"""
+    select model_id, trained_at, clf_pickle, reg_pickle, meta
+    from {table}
+    where exchange=:exchange and symbol=:symbol
+    order by trained_at desc
+    limit 1
+    """
+
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(q),
+            {"exchange": exchange, "symbol": symbol}
         )
-        clf.fit(X, y_cls)
+        row = result.mappings().first()
+
+    if not row:
+        return None, None, None
+
+    # 🔒 robust deserialization
+    try:
+        clf = pickle.loads(row["clf_pickle"]) if row.get("clf_pickle") else None
+    except Exception:
+        clf = None
+
+    try:
+        reg = pickle.loads(row["reg_pickle"]) if row.get("reg_pickle") else None
+    except Exception:
+        reg = None
+
+    meta_val = row.get("meta")
+
+    if meta_val is None:
+        meta_dict: Dict[str, Any] = {}
+    elif isinstance(meta_val, dict):
+        meta_dict = meta_val
     else:
-        base_clf.fit(X, y_cls)
-        clf = base_clf
-
-    return clf, reg, int(n)
-
-
-def predict(clf, reg, feat: pd.DataFrame):
-    """
-    Devuelve (proba_up, ret_exp) usando el último punto disponible del DataFrame feat.
-    """
-    if feat is None or feat.empty:
-        return None, None
-
-    last = feat.dropna(subset=FEATURES).tail(1)
-    if last.empty:
-        return None, None
-
-    X_last = last[FEATURES].astype(float)
-
-    proba = None
-    ret_exp = None
-
-    if clf is not None:
         try:
-            # clf puede ser CalibratedClassifierCV o el clasificador base
-            p = clf.predict_proba(X_last)[0, 1]
-            proba = float(p)
+            meta_dict = json.loads(meta_val)
         except Exception:
-            proba = None
+            meta_dict = {"raw_meta": str(meta_val)}
 
-    if reg is not None:
-        try:
-            r = reg.predict(X_last)[0]
-            ret_exp = float(r)
-        except Exception:
-            ret_exp = None
+    meta_dict.setdefault("model_id", row.get("model_id"))
+    meta_dict.setdefault("trained_at", str(row.get("trained_at")))
 
-    # Sanidad básica
-    if proba is not None:
-        proba = max(0.0, min(1.0, proba))
-
-    if ret_exp is not None and not np.isfinite(ret_exp):
-        ret_exp = None
-
-    return proba, ret_exp
+    return clf, reg, meta_dict
