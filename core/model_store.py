@@ -1,89 +1,126 @@
 from __future__ import annotations
 
+import json
 import pickle
+from typing import Any, Dict, Tuple, Optional
+
+import pandas as pd
 from sqlalchemy import text
 
 
-def _table_for_tf(tf: str) -> str:
+def _table_for_tf(tf: str | None) -> str:
     """
-    tf: "15m" (default) or "1d"
+    tf=None or '15m' -> model_store
+    tf='1d' -> model_store_1d
     """
-    return "model_store_1d" if tf == "1d" else "model_store"
+    tf = (tf or "").strip().lower()
+    return "public.model_store_1d" if tf == "1d" else "public.model_store"
 
 
-# ----------------------------
-# SAVE MODELS
-# ----------------------------
-def save_models(engine, exchange: str, symbol: str, model_id: str, clf, reg, meta: dict, tf: str = "15m"):
+def save_models(
+    engine,
+    exchange: str,
+    symbol: str,
+    model_id: str,
+    clf,
+    reg,
+    meta: Dict[str, Any] | None = None,
+    tf: str | None = None,
+):
+    """
+    Guarda modelos en Postgres como pickles + meta jsonb.
+    Compatible con SQLAlchemy 2.x (sin engine.execute).
+    """
     table = _table_for_tf(tf)
 
-    clf_bytes = pickle.dumps(clf)
-    reg_bytes = pickle.dumps(reg)
+    meta = meta or {}
+    meta_json = json.dumps(meta, ensure_ascii=False)
 
-    # Nota: meta lo guardamos como JSON (dict), Postgres lo acepta en jsonb
+    clf_blob = pickle.dumps(clf) if clf is not None else None
+    reg_blob = pickle.dumps(reg) if reg is not None else None
+
+    q = f"""
+    insert into {table}(
+        exchange,
+        symbol,
+        model_id,
+        trained_at,
+        clf_pickle,
+        reg_pickle,
+        meta
+    )
+    values (
+        :exchange,
+        :symbol,
+        :model_id,
+        now(),
+        :clf_pickle,
+        :reg_pickle,
+        :meta::jsonb
+    )
+    on conflict (exchange, symbol, model_id) do update set
+        trained_at = excluded.trained_at,
+        clf_pickle = excluded.clf_pickle,
+        reg_pickle = excluded.reg_pickle,
+        meta = excluded.meta
+    """
+
+    params = {
+        "exchange": exchange,
+        "symbol": symbol,
+        "model_id": model_id,
+        "clf_pickle": clf_blob,
+        "reg_pickle": reg_blob,
+        "meta": meta_json,
+    }
+
     with engine.begin() as conn:
-        conn.execute(
-            text(f"""
-                insert into public.{table}(
-                    exchange,
-                    symbol,
-                    model_id,
-                    trained_at,
-                    clf_pickle,
-                    reg_pickle,
-                    meta
-                )
-                values (
-                    :exchange,
-                    :symbol,
-                    :model_id,
-                    now(),
-                    :clf_pickle,
-                    :reg_pickle,
-                    :meta::jsonb
-                )
-            """),
-            {
-                "exchange": exchange,
-                "symbol": symbol,
-                "model_id": model_id,
-                "clf_pickle": clf_bytes,
-                "reg_pickle": reg_bytes,
-                "meta": meta,
-            },
-        )
+        conn.execute(text(q), params)
 
 
-# ----------------------------
-# LOAD LATEST MODELS
-# ----------------------------
-def load_latest_models(engine, exchange: str, symbol: str, tf: str = "15m"):
+def load_latest_models(
+    engine,
+    exchange: str,
+    symbol: str,
+    tf: str | None = None,
+) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
+    """
+    Carga el último par (clf, reg, meta) por trained_at desc.
+    Devuelve (clf, reg, meta_dict) o (None, None, None) si no hay.
+    """
     table = _table_for_tf(tf)
 
-    with engine.begin() as conn:
-        row = (
-            conn.execute(
-                text(f"""
-                    select model_id, clf_pickle, reg_pickle, meta
-                    from public.{table}
-                    where exchange=:exchange and symbol=:symbol
-                    order by trained_at desc
-                    limit 1
-                """),
-                {"exchange": exchange, "symbol": symbol},
-            )
-            .mappings()          # ✅ convierte a dict-like
-            .fetchone()
-        )
+    q = f"""
+    select model_id, trained_at, clf_pickle, reg_pickle, meta
+    from {table}
+    where exchange=:exchange and symbol=:symbol
+    order by trained_at desc
+    limit 1
+    """
+
+    with engine.connect() as conn:
+        res = conn.execute(text(q), {"exchange": exchange, "symbol": symbol})
+        row = res.mappings().first()  # ✅ para acceso por claves
 
     if not row:
         return None, None, None
 
-    clf = pickle.loads(row["clf_pickle"])
-    reg = pickle.loads(row["reg_pickle"])
-    meta = row["meta"] or {}
+    clf = pickle.loads(row["clf_pickle"]) if row.get("clf_pickle") is not None else None
+    reg = pickle.loads(row["reg_pickle"]) if row.get("reg_pickle") is not None else None
 
-    # por comodidad para score_*
-    meta["model_id"] = row["model_id"]
+    meta = row.get("meta")
+    # meta puede venir como dict (psycopg2 json) o como str
+    if meta is None:
+        meta_dict = {"model_id": row.get("model_id")}
+    elif isinstance(meta, dict):
+        meta_dict = meta
+    else:
+        try:
+            meta_dict = json.loads(meta)
+        except Exception:
+            meta_dict = {"raw_meta": str(meta)}
 
-    return clf, reg, meta
+    # Enriquecemos con model_id por si no viene
+    meta_dict.setdefault("model_id", row.get("model_id"))
+
+    return clf, reg, meta_dict
