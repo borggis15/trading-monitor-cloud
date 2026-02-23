@@ -1,288 +1,183 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
-from sqlalchemy import text
-from datetime import datetime, timezone
 
-from core.config import load_config
-from core.db import get_engine
-from core.features import compute_features
-from core.ml import predict
-from core.risk import size_from_atr, ev_bps
-from core.model_store import load_latest_models
-from core.decision import decide_action_v2
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 
 
-ROBUST_MIN_NTEST = 60
-ROBUST_MIN_SHARPE = 1.0
-ROBUST_MIN_HITRATE = 0.52
-ROBUST_MAX_DD_FLOOR = -0.35
+FEATURES_DEFAULT = ["rsi", "ema_fast", "ema_slow", "atr", "zscore"]
 
 
-def read_bars(engine, exchange: str, symbol: str) -> pd.DataFrame:
-    df = pd.read_sql(
-        text(
-            """
-            select ts, open, high, low, close, volume
-            from public.bars_15m
-            where exchange=:exchange and symbol=:symbol
-            order by ts
-            """
-        ),
-        engine,
-        params={"exchange": exchange, "symbol": symbol},
+@dataclass
+class Thresholds:
+    buy_proba: float
+    sell_proba: float
+    buy_ev_bps: float
+    sell_ev_bps: float
+
+
+def _prep_xy(df: pd.DataFrame, features: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    y_cls: 1 si ret_fwd > 0, 0 si <= 0
+    y_reg: ret_fwd (float)
+    """
+    need = list(features) + ["ret_fwd"]
+    d = df.dropna(subset=need).copy()
+    X = d[features].to_numpy(dtype=float)
+    y_reg = d["ret_fwd"].to_numpy(dtype=float)
+    y_cls = (y_reg > 0).astype(int)
+    return X, y_cls, y_reg
+
+
+def _compute_thresholds_from_train(
+    clf_cal: Any,
+    reg: Any,
+    X_train: np.ndarray,
+    fee_bps: float,
+    slippage_bps: float,
+) -> Thresholds:
+    """
+    Thresholds dinámicos (por activo) aprendidos del train:
+    - buy_proba: cuantil 70% de proba
+    - sell_proba: cuantil 30% de proba
+    - buy_ev_bps: cuantil 60% de EV estimada
+    - sell_ev_bps: cuantil 40% de EV estimada
+    """
+    proba = clf_cal.predict_proba(X_train)[:, 1]
+    ret_exp = reg.predict(X_train)
+
+    ev_bps = (ret_exp * 10000.0) - (fee_bps + slippage_bps)
+
+    buy_p = float(np.quantile(proba, 0.70))
+    sell_p = float(np.quantile(proba, 0.30))
+    buy_ev = float(np.quantile(ev_bps, 0.60))
+    sell_ev = float(np.quantile(ev_bps, 0.40))
+
+    # clamps razonables
+    buy_p = float(np.clip(buy_p, 0.55, 0.75))
+    sell_p = float(np.clip(sell_p, 0.25, 0.48))
+
+    # mínimos para evitar BUY/SELL por ruido
+    buy_ev = max(buy_ev, 25.0)
+    sell_ev = min(sell_ev, -25.0)
+
+    return Thresholds(buy_proba=buy_p, sell_proba=sell_p, buy_ev_bps=buy_ev, sell_ev_bps=sell_ev)
+
+
+def train_models(
+    feat: pd.DataFrame,
+    model_type: str = "hgb",
+    min_rows: int = 240,
+    features: Optional[list[str]] = None,
+    fee_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> Tuple[Any, Any, int, Dict[str, Any]]:
+    """
+    Devuelve: (clf_calibrado, reg, train_rows, meta)
+
+    meta incluye thresholds dinámicos:
+      meta["thresholds"] = {buy_proba, sell_proba, buy_ev_bps, sell_ev_bps}
+    """
+    features = features or FEATURES_DEFAULT
+
+    X, y_cls, y_reg = _prep_xy(feat, features)
+    n = int(len(X))
+    if n < int(min_rows):
+        raise ValueError(f"Not enough rows to train: {n} < min_rows={min_rows}")
+
+    # Modelos base
+    clf_base = HistGradientBoostingClassifier(
+        max_depth=3,
+        learning_rate=0.06,
+        max_iter=250,
+        early_stopping=True,
+        validation_fraction=0.15,
+        random_state=42,
     )
-    if df.empty:
-        return df
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    return df.set_index("ts").sort_index()
 
-
-def read_latest_metrics(engine, exchange: str, symbol: str):
-    row = pd.read_sql(
-        text(
-            """
-            select sharpe, max_dd, hit_rate, profit_factor, n_test, trained_at, model_id
-            from public.model_metrics
-            where exchange=:exchange and symbol=:symbol
-            order by trained_at desc
-            limit 1
-            """
-        ),
-        engine,
-        params={"exchange": exchange, "symbol": symbol},
+    reg = HistGradientBoostingRegressor(
+        max_depth=3,
+        learning_rate=0.06,
+        max_iter=250,
+        early_stopping=True,
+        validation_fraction=0.15,
+        random_state=42,
     )
-    if row.empty:
-        return None
-    return row.iloc[0].to_dict()
+
+    # Fit base clf
+    clf_base.fit(X, y_cls)
+
+    # Calibración sin leakage (TimeSeriesSplit)
+    tscv = TimeSeriesSplit(n_splits=3)
+    clf_cal = CalibratedClassifierCV(
+        estimator=clf_base,
+        method="sigmoid",
+        cv=tscv,
+    )
+    clf_cal.fit(X, y_cls)
+
+    # Fit reg
+    reg.fit(X, y_reg)
+
+    thr = _compute_thresholds_from_train(
+        clf_cal,
+        reg,
+        X_train=X,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+
+    meta: Dict[str, Any] = {
+        "features": features,
+        "thresholds": {
+            "buy_proba": thr.buy_proba,
+            "sell_proba": thr.sell_proba,
+            "buy_ev_bps": thr.buy_ev_bps,
+            "sell_ev_bps": thr.sell_ev_bps,
+        },
+        "calibration": {"method": "sigmoid", "cv": "TimeSeriesSplit(3)"},
+    }
+
+    return clf_cal, reg, n, meta
 
 
-def upsert_features(engine, exchange: str, symbol: str, feat: pd.DataFrame):
+def predict(
+    clf,
+    reg,
+    feat: pd.DataFrame,
+    features: Optional[list[str]] = None,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Predice sobre la última fila válida de feat.
+    Devuelve: (proba_up, ret_exp)
+    """
     if feat is None or feat.empty:
-        return 0
+        return None, None
 
-    f = feat.copy().reset_index()
-    f["ts"] = pd.to_datetime(f["ts"], utc=True)
-    f["exchange"] = exchange
-    f["symbol"] = symbol
+    features = features or FEATURES_DEFAULT
+    d = feat.dropna(subset=features).tail(1)
+    if d.empty:
+        return None, None
 
-    cols = ["exchange", "symbol", "ts", "rsi", "ema_fast", "ema_slow", "atr", "zscore", "ret_fwd"]
-    for c in cols:
-        if c not in f.columns:
-            f[c] = pd.NA
+    X = d[features].to_numpy(dtype=float)
 
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                insert into public.features_15m(exchange,symbol,ts,rsi,ema_fast,ema_slow,atr,zscore,ret_fwd)
-                values (:exchange,:symbol,:ts,:rsi,:ema_fast,:ema_slow,:atr,:zscore,:ret_fwd)
-                on conflict (exchange,symbol,ts) do update set
-                  rsi=excluded.rsi,
-                  ema_fast=excluded.ema_fast,
-                  ema_slow=excluded.ema_slow,
-                  atr=excluded.atr,
-                  zscore=excluded.zscore,
-                  ret_fwd=excluded.ret_fwd
-                """
-            ),
-            f[cols].to_dict(orient="records"),
-        )
-    return len(f)
+    proba = None
+    ret_exp = None
 
+    try:
+        proba = float(clf.predict_proba(X)[0, 1])
+    except Exception:
+        proba = None
 
-def upsert_signal(engine, row: dict):
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                insert into public.signals(
-                  exchange,symbol,ts,
-                  action,proba_up,ret_exp,risk_est,ev_bps,
-                  size_eur,sl_price,tp_price,horizon,explanation,model_id,
-                  asset_id, asset_name
-                )
-                values (
-                  :exchange,:symbol,:ts,
-                  :action,:proba_up,:ret_exp,:risk_est,:ev_bps,
-                  :size_eur,:sl_price,:tp_price,:horizon,:explanation,:model_id,
-                  :asset_id, :asset_name
-                )
-                on conflict (exchange,symbol,ts) do update set
-                  action=excluded.action,
-                  proba_up=excluded.proba_up,
-                  ret_exp=excluded.ret_exp,
-                  risk_est=excluded.risk_est,
-                  ev_bps=excluded.ev_bps,
-                  size_eur=excluded.size_eur,
-                  sl_price=excluded.sl_price,
-                  tp_price=excluded.tp_price,
-                  horizon=excluded.horizon,
-                  explanation=excluded.explanation,
-                  model_id=excluded.model_id,
-                  asset_id=excluded.asset_id,
-                  asset_name=excluded.asset_name
-                """
-            ),
-            row,
-        )
+    try:
+        ret_exp = float(reg.predict(X)[0])
+    except Exception:
+        ret_exp = None
 
-
-def resolve_series(engine, inst: dict) -> tuple[str | None, str | None]:
-    candidates = []
-    candidates.append(("XETR", inst["xetra_symbol"]))
-    for c in inst.get("stooq_candidates", []) or []:
-        candidates.append(("STOOQ", c))
-    for y in inst.get("yahoo_candidates", []) or []:
-        candidates.append(("YAHOO", y))
-    candidates.append(("PRIMARY", inst["primary_symbol"]))
-
-    for ex, sym in candidates:
-        bars = read_bars(engine, ex, sym)
-        if bars is not None and not bars.empty:
-            print(f"[SERIES] {inst['name']} using {ex}:{sym} bars={len(bars)}")
-            return ex, sym
-
-    return None, None
-
-
-def robust_ok_for_buy(m: dict | None) -> tuple[bool, str]:
-    if not m:
-        return False, "no_metrics"
-
-    n_test = m.get("n_test")
-    sharpe = m.get("sharpe")
-    max_dd = m.get("max_dd")
-    hit = m.get("hit_rate")
-
-    reasons = []
-    ok = True
-
-    if n_test is None or int(n_test) < ROBUST_MIN_NTEST:
-        ok = False
-        reasons.append(f"n_test<{ROBUST_MIN_NTEST}")
-    if sharpe is None or float(sharpe) < ROBUST_MIN_SHARPE:
-        ok = False
-        reasons.append(f"sharpe<{ROBUST_MIN_SHARPE}")
-    if hit is None or float(hit) < ROBUST_MIN_HITRATE:
-        ok = False
-        reasons.append(f"hit_rate<{ROBUST_MIN_HITRATE}")
-    if max_dd is None or float(max_dd) < ROBUST_MAX_DD_FLOOR:
-        ok = False
-        reasons.append(f"max_dd<{ROBUST_MAX_DD_FLOOR}")
-
-    return ok, ("ok" if ok else ", ".join(reasons))
-
-
-def main():
-    cfg = load_config()
-    engine = get_engine()
-
-    processed = 0
-    horizon_days = int(cfg["ml"]["horizon_bars"])
-
-    for inst in cfg["universe"]:
-        name = inst["name"]
-        asset_id = inst.get("isin") or inst.get("asset_id") or name
-        asset_name = name
-
-        ex, sym = resolve_series(engine, inst)
-        if not ex or not sym:
-            print(f"[SCORE SKIP] {name}: no bars in DB")
-            continue
-
-        bars = read_bars(engine, ex, sym)
-
-        # Ventana reciente para features (eficiencia)
-        bars = bars.tail(800)
-
-        feat = compute_features(bars, horizon_bars=horizon_days)
-        if feat is None or feat.empty:
-            print(f"[SCORE SKIP] {name}: empty features")
-            continue
-
-        upsert_features(engine, ex, sym, feat)
-
-        clf, reg, meta = load_latest_models(engine, ex, sym, tf=None)
-        proba, ret_exp = predict(clf, reg, feat)
-
-        last = feat.dropna().tail(1)
-        risk_est = None
-        if not last.empty and "atr" in last.columns:
-            atr = float(last["atr"].iloc[0])
-            price = float(bars["close"].iloc[-1])
-            if price > 0:
-                risk_est = atr / price
-
-        ev = ev_bps(
-            ret_exp,
-            risk_est,
-            float(cfg["backtest"]["fee_bps"]),
-            float(cfg["backtest"]["slippage_bps"]),
-        )
-
-        # ✅ DECISIÓN v2 (dinámica por activo)
-        action, dbg = decide_action_v2(proba, ev, meta)
-
-        # Robust gate para BUY
-        m = read_latest_metrics(engine, ex, sym)
-        ok_buy, ok_reason = robust_ok_for_buy(m)
-        if action == "BUY" and not ok_buy:
-            action = "HOLD"
-
-        size_eur = sl = tp = None
-        if action == "BUY" and not last.empty and "atr" in last.columns:
-            atr = float(last["atr"].iloc[0])
-            price = float(bars["close"].iloc[-1])
-            size_eur, sl = size_from_atr(
-                capital_eur=float(cfg["signals"]["capital_eur"]),
-                risk_pct=float(cfg["signals"]["risk_per_trade_pct"]),
-                max_pos_pct=float(cfg["signals"]["max_position_pct"]),
-                price=price,
-                atr=atr,
-                sl_atr_mult=float(cfg["signals"]["sl_atr_mult"]),
-            )
-            tp = float(price + float(cfg["signals"]["tp_atr_mult"]) * atr)
-
-        ts = bars.index[-1] if len(bars) else datetime.now(timezone.utc)
-        model_id = (meta or {}).get("model_id", "no_model")
-
-        expl = [
-            f"name={name}",
-            f"series={ex}:{sym}",
-            f"model={model_id}",
-            f"proba={None if proba is None else round(float(proba),6)}",
-            f"ret_exp={None if ret_exp is None else round(float(ret_exp),6)}",
-            f"risk_est={None if risk_est is None else round(float(risk_est),6)}",
-            f"ev_bps={None if ev is None else round(float(ev),6)}",
-            f"gate={ok_reason}",
-            f"v2={dbg}",
-        ]
-
-        upsert_signal(engine, {
-            "exchange": ex,
-            "symbol": sym,
-            "ts": ts,
-            "action": action,
-            "proba_up": proba,
-            "ret_exp": ret_exp,
-            "risk_est": risk_est,
-            "ev_bps": ev,
-            "size_eur": size_eur,
-            "sl_price": sl,
-            "tp_price": tp,
-            "horizon": f"{horizon_days}d",
-            "explanation": " | ".join(expl),
-            "model_id": model_id,
-            "asset_id": asset_id,
-            "asset_name": asset_name,
-        })
-
-        processed += 1
-        print(f"[SCORE OK] {name} -> {action} ({ex}:{sym}) gate={ok_reason}")
-
-    print(f"SCORE OK: {processed} inst")
-
-
-if __name__ == "__main__":
-    main()
+    return proba, ret_exp
