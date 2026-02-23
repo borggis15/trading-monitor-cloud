@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import json
 import pickle
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
 
-import pandas as pd
 from sqlalchemy import text
 
 
@@ -26,10 +25,11 @@ def save_models(
     reg,
     meta: Dict[str, Any] | None = None,
     tf: str | None = None,
-):
+) -> None:
     """
-    Guarda modelos en Postgres como pickles + meta jsonb.
-    Compatible con SQLAlchemy 2.x (sin engine.execute).
+    Guarda modelos en Postgres como pickles + meta JSONB.
+    Compatible SQLAlchemy 2.x.
+    IMPORTANTE: usamos CAST(:meta AS jsonb) para evitar el bug de :meta::jsonb.
     """
     table = _table_for_tf(tf)
 
@@ -56,7 +56,7 @@ def save_models(
         now(),
         :clf_pickle,
         :reg_pickle,
-        :meta::jsonb
+        CAST(:meta AS jsonb)
     )
     on conflict (exchange, symbol, model_id) do update set
         trained_at = excluded.trained_at,
@@ -85,8 +85,8 @@ def load_latest_models(
     tf: str | None = None,
 ) -> Tuple[Optional[Any], Optional[Any], Optional[Dict[str, Any]]]:
     """
-    Carga el último par (clf, reg, meta) por trained_at desc.
-    Devuelve (clf, reg, meta_dict) o (None, None, None) si no hay.
+    Carga el último (clf, reg, meta) por trained_at desc.
+    Devuelve (None, None, None) si no hay modelo.
     """
     table = _table_for_tf(tf)
 
@@ -100,7 +100,7 @@ def load_latest_models(
 
     with engine.connect() as conn:
         res = conn.execute(text(q), {"exchange": exchange, "symbol": symbol})
-        row = res.mappings().first()  # ✅ para acceso por claves
+        row = res.mappings().first()  # acceso por claves (evita tuple index)
 
     if not row:
         return None, None, None
@@ -108,19 +108,16 @@ def load_latest_models(
     clf = pickle.loads(row["clf_pickle"]) if row.get("clf_pickle") is not None else None
     reg = pickle.loads(row["reg_pickle"]) if row.get("reg_pickle") is not None else None
 
-    meta = row.get("meta")
-    # meta puede venir como dict (psycopg2 json) o como str
-    if meta is None:
-        meta_dict = {"model_id": row.get("model_id")}
-    elif isinstance(meta, dict):
-        meta_dict = meta
+    meta_val = row.get("meta")
+    if meta_val is None:
+        meta_dict: Dict[str, Any] = {}
+    elif isinstance(meta_val, dict):
+        meta_dict = meta_val
     else:
         try:
-            meta_dict = json.loads(meta)
+            meta_dict = json.loads(meta_val)
         except Exception:
-            meta_dict = {"raw_meta": str(meta)}
+            meta_dict = {"raw_meta": str(meta_val)}
 
-    # Enriquecemos con model_id por si no viene
     meta_dict.setdefault("model_id", row.get("model_id"))
-
     return clf, reg, meta_dict
