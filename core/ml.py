@@ -10,92 +10,129 @@ from sklearn.calibration import CalibratedClassifierCV
 FEATURES = ["rsi", "ema_fast", "ema_slow", "atr", "zscore"]
 
 
-def _prep_xy(feat: pd.DataFrame):
-    df = feat.dropna(subset=FEATURES + ["ret_fwd"]).copy()
-    if df.empty:
+def _prep_xy(df: pd.DataFrame):
+    """
+    Prepara X, y_cls, y_reg desde un DataFrame de features.
+    Requiere: FEATURES y 'ret_fwd' en df.
+    """
+    need = FEATURES + ["ret_fwd"]
+    if df is None or df.empty or any(c not in df.columns for c in need):
         return None, None, None
 
-    X = df[FEATURES].astype(float)
-    y_up = (df["ret_fwd"].astype(float) > 0).astype(int)
-    y_ret = df["ret_fwd"].astype(float)
-    return df, X, y_up, y_ret
+    d = df.dropna(subset=need).copy()
+    if d.empty:
+        return None, None, None
+
+    X = d[FEATURES].astype(float)
+
+    # Clasificación: "sube" si ret_fwd > 0
+    y_cls = (d["ret_fwd"].astype(float) > 0.0).astype(int)
+
+    # Regresión: retorno esperado
+    y_reg = d["ret_fwd"].astype(float)
+
+    return X, y_cls, y_reg
 
 
 def train_models(
     feat: pd.DataFrame,
     model_type: str = "hgb",
     min_rows: int = 200,
+    calibrate: bool = True,
+    cal_cv: int = 3,
 ):
     """
     Entrena:
-      - clasificador (probabilidad subida)
-      - regresor (retorno esperado)
-    + Calibración de probas con holdout time-based (sigmoid) => más realista.
+      - clf: clasificador prob(up)
+      - reg: regresor retorno esperado
+
+    NOTA sobre calibración:
+    - scikit-learn reciente ya NO permite cv="prefit".
+    - Usamos CalibratedClassifierCV con CV interno (cal_cv=3 por defecto).
     """
-    out = _prep_xy(feat)
-    if out[0] is None:
+    X, y_cls, y_reg = _prep_xy(feat)
+    if X is None:
         return None, None, 0
-    df, X, y_up, y_ret = out
 
-    if len(df) < min_rows:
-        return None, None, int(len(df))
+    n = len(X)
+    if n < min_rows:
+        # no entrenamos si no hay histórico suficiente
+        return None, None, int(n)
 
-    # split time-based (no shuffle)
-    split = int(len(df) * 0.8)
-    if split < min_rows:
-        split = min_rows
+    if model_type != "hgb":
+        raise ValueError(f"Unsupported model_type={model_type}. Use 'hgb'.")
 
-    X_tr, X_va = X.iloc[:split], X.iloc[split:]
-    y_tr, y_va = y_up.iloc[:split], y_up.iloc[split:]
-    r_tr, r_va = y_ret.iloc[:split], y_ret.iloc[split:]
-
-    clf = HistGradientBoostingClassifier(
+    # Base models
+    base_clf = HistGradientBoostingClassifier(
         max_depth=3,
-        learning_rate=0.05,
+        learning_rate=0.07,
         max_iter=300,
         random_state=42,
     )
+
     reg = HistGradientBoostingRegressor(
         max_depth=3,
-        learning_rate=0.05,
+        learning_rate=0.07,
         max_iter=300,
         random_state=42,
     )
 
-    clf.fit(X_tr, y_tr)
-    reg.fit(X_tr, r_tr)
+    # Entrenamos regresor
+    reg.fit(X, y_reg)
 
-    # Calibración SOLO si hay val suficiente
-    clf_cal = clf
-    if len(X_va) >= 50 and y_va.nunique() > 1:
-        clf_cal = CalibratedClassifierCV(clf, method="sigmoid", cv="prefit")
-        clf_cal.fit(X_va, y_va)
+    # Entrenamos clasificador (con calibración opcional)
+    if calibrate:
+        # ✅ Calibración robusta y compatible con sklearn moderno:
+        # CalibratedClassifierCV entrena internamente con CV.
+        clf = CalibratedClassifierCV(
+            estimator=base_clf,
+            method="sigmoid",
+            cv=int(cal_cv),
+        )
+        clf.fit(X, y_cls)
+    else:
+        base_clf.fit(X, y_cls)
+        clf = base_clf
 
-    return clf_cal, reg, int(len(df))
+    return clf, reg, int(n)
 
 
-def predict(clf, reg, feat_latest: pd.DataFrame):
+def predict(clf, reg, feat: pd.DataFrame):
     """
-    Devuelve:
-      proba_up (float)
-      ret_exp (float)
+    Devuelve (proba_up, ret_exp) usando el último punto disponible del DataFrame feat.
     """
-    if clf is None or reg is None or feat_latest is None or feat_latest.empty:
+    if feat is None or feat.empty:
         return None, None
 
-    df = feat_latest.dropna(subset=FEATURES).copy()
-    if df.empty:
+    last = feat.dropna(subset=FEATURES).tail(1)
+    if last.empty:
         return None, None
 
-    X = df[FEATURES].astype(float).tail(1)
-    try:
-        proba = float(clf.predict_proba(X)[0, 1])
-    except Exception:
-        proba = None
+    X_last = last[FEATURES].astype(float)
 
-    try:
-        ret_exp = float(reg.predict(X)[0])
-    except Exception:
+    proba = None
+    ret_exp = None
+
+    if clf is not None:
+        try:
+            # clf puede ser CalibratedClassifierCV o el clasificador base
+            p = clf.predict_proba(X_last)[0, 1]
+            proba = float(p)
+        except Exception:
+            proba = None
+
+    if reg is not None:
+        try:
+            r = reg.predict(X_last)[0]
+            ret_exp = float(r)
+        except Exception:
+            ret_exp = None
+
+    # Sanidad básica
+    if proba is not None:
+        proba = max(0.0, min(1.0, proba))
+
+    if ret_exp is not None and not np.isfinite(ret_exp):
         ret_exp = None
 
     return proba, ret_exp
